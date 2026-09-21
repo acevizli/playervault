@@ -1,0 +1,55 @@
+# Unity generated
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]serSettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+
+# Asset meta data for ignored folders
+!/[Aa]ssets/**/*.meta
+
+# Never ignore Unity meta files elsewhere
+/[Aa]ssets/AssetStoreTools*
+
+# Visual Studio / Rider / VS Code
+.vs/
+.idea/
+.vscode/
+*.csproj
+*.unityproj
+*.sln
+*.slnx
+*.suo
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# Gradle / Android export
+ExportedObj/
+.gradle/
+*.apk
+*.aab
+*.keystore
+!/**/local.properties
+
+# iOS export
+[Ii]OS[Bb]uild/
+DerivedData/
+
+# Crashlytics / Unity3D generated
+sysinfo.txt
+*.stackdump
+crashlytics-build.properties
+
+# macOS
+.DS_Store
