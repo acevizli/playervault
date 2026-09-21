@@ -45,6 +45,8 @@ ExportedObj/
 # iOS export
 [Ii]OS[Bb]uild/
 DerivedData/
+/*/[Ii]OS/
+*_BackUpThisFolder_ButDontShipItWithYourGame/
 
 # Crashlytics / Unity3D generated
 sysinfo.txt
