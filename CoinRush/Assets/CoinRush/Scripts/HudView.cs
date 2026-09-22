@@ -35,7 +35,16 @@ namespace CoinRush
         static readonly Color Panel = new Color(0.05f, 0.07f, 0.11f, 0.72f);
         static readonly Color Scrim = new Color(0.03f, 0.04f, 0.07f, 0.94f);
 
-        /// <summary>A button and the two graphics it needs restyled when its state changes.</summary>
+        /// <summary>
+        /// A button and the label on it.
+        /// </summary>
+        /// <remarks>
+        /// The fill colour is set through <see cref="Selectable.colors"/> rather than on the Image.
+        /// Selectable owns its target graphic: every state change cross-fades the canvas renderer
+        /// back to whichever ColorBlock entry matches the current state, so a colour written
+        /// straight to the Image is overwritten a frame later. The default block is white for every
+        /// state, which is why these buttons flashed white and swallowed their own white labels.
+        /// </remarks>
         sealed class ButtonView
         {
             public Button Button;
@@ -45,8 +54,21 @@ namespace CoinRush
             public void SetInteractable(bool interactable, Color on, Color off)
             {
                 Button.interactable = interactable;
-                Fill.color = interactable ? on : off;
+                Tint(interactable ? on : off);
                 Label.color = interactable ? Color.white : Dim;
+            }
+
+            public void Tint(Color fill)
+            {
+                var colors = Button.colors;
+                colors.normalColor = fill;
+                colors.highlightedColor = fill;
+                colors.selectedColor = fill;
+                colors.pressedColor = new Color(fill.r * 0.72f, fill.g * 0.72f, fill.b * 0.72f, fill.a);
+                colors.disabledColor = fill;   // The caller already passed the colour for this state.
+                colors.colorMultiplier = 1f;
+                colors.fadeDuration = 0.06f;
+                Button.colors = colors;
             }
         }
 
@@ -497,16 +519,21 @@ namespace CoinRush
         static ButtonView CreateButton(Transform parent, string name, string label, Color fill,
             Vector2 anchorMin, Vector2 anchorMax, Vector2 offsetMin, Vector2 offsetMax, int fontSize)
         {
-            var image = CreatePanel(parent, name, fill, anchorMin, anchorMax, offsetMin, offsetMax);
+            // White, deliberately: the ColorBlock tint multiplies the Image's own colour, so the
+            // Image has to be the identity or every state comes out doubled.
+            var image = CreatePanel(parent, name, Color.white, anchorMin, anchorMax, offsetMin, offsetMax);
             image.raycastTarget = true;
 
             var button = image.gameObject.AddComponent<Button>();
             button.targetGraphic = image;
 
             var text = CreateLabel(image.transform, "Label", TextAnchor.MiddleCenter,
-                Vector2.zero, Vector2.one, Vector2.zero, Vector2.zero, fontSize, Color.white);
+                Vector2.zero, Vector2.one, new Vector2(24f, 8f), new Vector2(-24f, -8f),
+                fontSize, Color.white);
 
-            return new ButtonView { Button = button, Fill = image, Label = text };
+            var view = new ButtonView { Button = button, Fill = image, Label = text };
+            view.Tint(fill);
+            return view;
         }
 
         static Text CreateLabel(Transform parent, string name, TextAnchor alignment,
