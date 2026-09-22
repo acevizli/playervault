@@ -1200,12 +1200,8 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: d4d91534187f4bae82aa2a35678b2234, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::CoinRush.ArenaBuilder
-  coinCount: 12
-  coinRingRadius: 10
   coinHeight: 0.7
   coinMaterial: {fileID: 2100000, guid: cf75edbbbe984db9b09c64ba39e8ee13, type: 2}
-  hazardCount: 5
-  hazardRingRadius: 5.5
   hazardSize: 1.4
   hazardMaterial: {fileID: 2100000, guid: d74667c9ce984ddbb763d7f1768e1bf2, type: 2}
 --- !u!114 &1900000004
@@ -1223,9 +1219,33 @@ MonoBehaviour:
   ball: {fileID: 869454263}
   arena: {fileID: 1900000003}
   vaultBehaviour: {fileID: 1900000006}
+  levels:
+  - name: WARM UP
+    coinCount: 8
+    coinRingRadius: 9
+    hazardCount: 3
+    hazardRingRadius: 5.5
+    hazardOrbitDegreesPerSecond: 0
+    unlockCost: 0
+    firstClearReward: 100
+  - name: CROSSFIRE
+    coinCount: 12
+    coinRingRadius: 10.5
+    hazardCount: 6
+    hazardRingRadius: 6
+    hazardOrbitDegreesPerSecond: 26
+    unlockCost: 150
+    firstClearReward: 200
+  - name: GAUNTLET
+    coinCount: 16
+    coinRingRadius: 12
+    hazardCount: 9
+    hazardRingRadius: 6.5
+    hazardOrbitDegreesPerSecond: -42
+    unlockCost: 400
+    firstClearReward: 350
   livesPerRun: 3
   coinsPerPickup: 10
-  firstClearReward: 100
 --- !u!114 &1900000005
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1261,9 +1281,22 @@ MonoBehaviour:
     initial: 3
     hasMax: 1
     max: 3
+  - key: levels
+    initial: 1
+    hasMax: 1
+    max: 3
   openOnAwake: 1
   allowUndeclaredResources: 0
   flushOnApplicationPause: 1
+  maxAttempts: 3
+  requestTimeoutSeconds: 15
+  retryBaseDelaySeconds: 0.5
+  retryMaxDelaySeconds: 10
+  retryJitter: 0.25
+  resumePendingOnOpen: 1
+  flushMode: 0
+  debounceIntervalSeconds: 1
+  onCorruptData: 0
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

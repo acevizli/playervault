@@ -4,10 +4,10 @@ using UnityEngine;
 namespace CoinRush
 {
     /// <summary>
-    /// Lays out the collectables and hazards at runtime.
+    /// Lays out the collectables and hazards at runtime, from a <see cref="LevelDefinition"/>.
     ///
     /// Coins and hazards are generated rather than placed by hand in the scene. A ring layout is a few
-    /// lines of trigonometry, it rebuilds instantly when the level restarts, and — as the previous
+    /// lines of trigonometry, it rebuilds instantly when the level restarts, and — as an earlier
     /// ticket demonstrated painfully — hand-placed objects in the Editor are exactly where transform
     /// mistakes come from. The trade is that you cannot art-direct an individual coin, which for a
     /// test arena is not a cost worth paying to avoid.
@@ -15,14 +15,10 @@ namespace CoinRush
     public sealed class ArenaBuilder : MonoBehaviour
     {
         [Header("Coins")]
-        [SerializeField] int coinCount = 12;
-        [SerializeField] float coinRingRadius = 10f;
         [SerializeField] float coinHeight = 0.7f;
         [SerializeField] Material coinMaterial;
 
         [Header("Hazards")]
-        [SerializeField] int hazardCount = 5;
-        [SerializeField] float hazardRingRadius = 5.5f;
         [SerializeField] float hazardSize = 1.4f;
         [SerializeField] Material hazardMaterial;
 
@@ -37,24 +33,33 @@ namespace CoinRush
         /// <summary>The hazards in the level as of the last <see cref="Build"/>.</summary>
         public IReadOnlyList<Hazard> Hazards => _hazards;
 
-        /// <summary>Clears any existing level and lays out a fresh one.</summary>
-        public void Build()
+        /// <summary>Clears any existing level and lays out the one described by <paramref name="level"/>.</summary>
+        public void Build(LevelDefinition level)
         {
             Clear();
 
             _container = new GameObject("Level").transform;
             _container.SetParent(transform, worldPositionStays: false);
 
-            for (var i = 0; i < coinCount; i++)
+            for (var i = 0; i < level.coinCount; i++)
             {
-                _coins.Add(CreateCoin(PointOnRing(i, coinCount, coinRingRadius, coinHeight)));
+                _coins.Add(CreateCoin(PointOnRing(i, level.coinCount, level.coinRingRadius, coinHeight)));
             }
 
-            for (var i = 0; i < hazardCount; i++)
+            // Hazards hang off their own container so the whole ring can be orbited as one rigid
+            // body. It also keeps the coins still while the hazards move.
+            var hazardRoot = new GameObject("Hazards").transform;
+            hazardRoot.SetParent(_container, worldPositionStays: false);
+            hazardRoot.gameObject.AddComponent<Rotator>().degreesPerSecond = level.hazardOrbitDegreesPerSecond;
+
+            for (var i = 0; i < level.hazardCount; i++)
             {
                 // Offset by half a step so hazards sit between coins rather than under them.
-                var angleOffset = 0.5f;
-                _hazards.Add(CreateHazard(PointOnRing(i + angleOffset, hazardCount, hazardRingRadius, hazardSize * 0.5f)));
+                const float angleOffset = 0.5f;
+                var position = PointOnRing(
+                    i + angleOffset, level.hazardCount, level.hazardRingRadius, hazardSize * 0.5f);
+
+                _hazards.Add(CreateHazard(hazardRoot, position));
             }
         }
 
@@ -102,11 +107,11 @@ namespace CoinRush
             return root.AddComponent<Coin>();
         }
 
-        Hazard CreateHazard(Vector3 position)
+        Hazard CreateHazard(Transform parent, Vector3 position)
         {
             var block = GameObject.CreatePrimitive(PrimitiveType.Cube);
             block.name = "Hazard";
-            block.transform.SetParent(_container, worldPositionStays: false);
+            block.transform.SetParent(parent, worldPositionStays: false);
             block.transform.position = position;
             block.transform.localScale = Vector3.one * hazardSize;
             Paint(block, hazardMaterial);

@@ -1,33 +1,79 @@
+using System.Text;
 using PlayerVault;
 using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.InputSystem.UI;
 using UnityEngine.UI;
 
 namespace CoinRush
 {
     /// <summary>
-    /// The heads-up display: coins, lives, a phase banner, and the state of the reward claim.
+    /// The heads-up display: balances, the level being played, the state of the reward claim, the
+    /// shop button for the next level, and an inspector panel showing the vault's whole contents.
     ///
-    /// The whole canvas is built in <see cref="Awake"/> rather than authored in the scene. Four labels
-    /// do not justify hand-placing a Canvas, a scaler and four rect transforms, and each of those is a
-    /// place to mis-set a value that only misbehaves on an aspect ratio nobody tested. It also uses the
-    /// built-in legacy font: TextMeshPro refuses to render a character until its essential resources
-    /// are imported, which puts a dialog box between a fresh clone and a running game.
+    /// The canvas is built in <see cref="Awake"/> rather than authored in the scene. A dozen widgets
+    /// do not justify hand-placing a Canvas, a scaler and a rect transform each, and every one of
+    /// those is a place to mis-set a value that only misbehaves on an aspect ratio nobody tested. It
+    /// also uses the built-in legacy font: TextMeshPro refuses to render a character until its
+    /// essential resources are imported, which puts a dialog box between a fresh clone and a running
+    /// game.
     /// </summary>
     [RequireComponent(typeof(LevelController))]
     public sealed class HudView : MonoBehaviour
     {
         const int ReferenceWidth = 1080;
         const int ReferenceHeight = 2340;
+        const float NoticeSeconds = 2.5f;
+        const float PanelRefreshSeconds = 0.5f;
+
+        static readonly Color Ink = new Color(0.96f, 0.97f, 1f);
+        static readonly Color Dim = new Color(0.62f, 0.68f, 0.78f);
+        static readonly Color Gold = new Color(1f, 0.82f, 0.28f);
+        static readonly Color Warn = new Color(0.98f, 0.76f, 0.35f);
+        static readonly Color Bad = new Color(1f, 0.44f, 0.4f);
+        static readonly Color Accent = new Color(0.16f, 0.62f, 0.98f);
+        static readonly Color Panel = new Color(0.05f, 0.07f, 0.11f, 0.72f);
+        static readonly Color Scrim = new Color(0.03f, 0.04f, 0.07f, 0.94f);
+
+        /// <summary>A button and the two graphics it needs restyled when its state changes.</summary>
+        sealed class ButtonView
+        {
+            public Button Button;
+            public Image Fill;
+            public Text Label;
+
+            public void SetInteractable(bool interactable, Color on, Color off)
+            {
+                Button.interactable = interactable;
+                Fill.color = interactable ? on : off;
+                Label.color = interactable ? Color.white : Dim;
+            }
+        }
 
         LevelController _level;
+
         Text _coins;
         Text _lives;
+        Text _levelLabel;
+        Text _pending;
         Text _banner;
         Text _claim;
+        Text _notice;
+        Text _vaultText;
+
+        ButtonView _unlock;
+        ButtonView _vaultToggle;
+        ButtonView _retry;
+        Button _tapCatcher;
+
+        GameObject _vaultPanel;
+        float _noticeUntil;
+        float _panelRefreshAt;
 
         void Awake()
         {
             _level = GetComponent<LevelController>();
+            EnsureEventSystem();
             Build();
         }
 
@@ -37,6 +83,9 @@ namespace CoinRush
             _level.LivesChanged += OnLivesChanged;
             _level.PhaseChanged += OnPhaseChanged;
             _level.ClaimChanged += OnClaimChanged;
+            _level.LevelChanged += OnLevelChanged;
+            _level.PendingClaimsChanged += OnPendingClaimsChanged;
+            _level.Notice += OnNotice;
         }
 
         void OnDisable()
@@ -45,27 +94,95 @@ namespace CoinRush
             _level.LivesChanged -= OnLivesChanged;
             _level.PhaseChanged -= OnPhaseChanged;
             _level.ClaimChanged -= OnClaimChanged;
+            _level.LevelChanged -= OnLevelChanged;
+            _level.PendingClaimsChanged -= OnPendingClaimsChanged;
+            _level.Notice -= OnNotice;
         }
 
-        void OnCoinsChanged(long value) => _coins.text = $"COINS  {value}";
+        void Update()
+        {
+            if (_notice.text.Length > 0 && Time.unscaledTime > _noticeUntil)
+            {
+                _notice.text = string.Empty;
+            }
 
-        void OnLivesChanged(long value) => _lives.text = $"LIVES  {value}";
+            if (_vaultPanel.activeSelf && Time.unscaledTime >= _panelRefreshAt)
+            {
+                _panelRefreshAt = Time.unscaledTime + PanelRefreshSeconds;
+                RefreshVaultPanel();
+            }
+        }
+
+        // ------------------------------------------------------------------ model -> view
+
+        void OnCoinsChanged(long value)
+        {
+            _coins.text = $"COINS  {value}";
+            RefreshUnlockButton();
+        }
+
+        /// <summary>
+        /// Renders the ceiling alongside the balance. The maximum is a configured fact the vault
+        /// already knows, and a HUD that prints a bare "3" makes the cap invisible until the moment
+        /// it silently swallows a grant.
+        /// </summary>
+        void OnLivesChanged(long value)
+        {
+            var max = _level.LivesMax;
+            _lives.text = max.HasValue ? $"LIVES  {value}/{max.Value}" : $"LIVES  {value}";
+        }
+
+        void OnLevelChanged(LevelDefinition level)
+        {
+            _levelLabel.text = level == null
+                ? string.Empty
+                : $"LEVEL {_level.CurrentIndex + 1}/{_level.LevelCount}  {level.name.ToUpperInvariant()}";
+
+            RefreshUnlockButton();
+        }
+
+        /// <summary>
+        /// The count of claims the vault has not settled yet, shown permanently rather than only on
+        /// the screen that produced them. It is the visible half of the guarantee the case asks for:
+        /// the unlock button next to it stays live while this is non-zero, because a claim in flight
+        /// reserves nothing.
+        /// </summary>
+        void OnPendingClaimsChanged(int count)
+        {
+            if (count == 0)
+            {
+                _pending.text = string.Empty;
+                _retry.Button.gameObject.SetActive(false);
+                return;
+            }
+
+            _pending.text = count == 1 ? "1 REWARD PENDING" : $"{count} REWARDS PENDING";
+            _pending.color = Warn;
+            _retry.Button.gameObject.SetActive(true);
+        }
 
         void OnPhaseChanged(LevelPhase phase)
         {
             switch (phase)
             {
                 case LevelPhase.Completed:
-                    _banner.text = "LEVEL COMPLETE\n<tap to play again>";
+                    _banner.text = "LEVEL COMPLETE\nTAP TO PLAY AGAIN";
                     break;
+
                 case LevelPhase.GameOver:
-                    _banner.text = "OUT OF LIVES\n<tap to try again>";
+                    _banner.text = "OUT OF LIVES\nTAP TO TRY AGAIN";
                     break;
+
                 default:
                     _banner.text = string.Empty;
-                    _claim.text = string.Empty;
                     break;
             }
+
+            // Only live between runs. While the ball is rolling the catcher would sit in front of
+            // nothing that matters, but leaving it enabled is one more surface to reason about.
+            _tapCatcher.gameObject.SetActive(phase == LevelPhase.Completed || phase == LevelPhase.GameOver);
+
+            RefreshUnlockButton();
         }
 
         /// <summary>
@@ -85,28 +202,149 @@ namespace CoinRush
             {
                 case ClaimStatus.Granted:
                     _claim.text = record.WasClamped
-                        ? $"REWARD +{record.AmountApplied} (capped from {record.AmountRequested})"
+                        ? $"REWARD +{record.AmountApplied} (CAPPED FROM {record.AmountRequested})"
                         : $"REWARD +{record.AmountApplied} COINS";
-                    _claim.color = new Color(1f, 0.85f, 0.25f);
+                    _claim.color = Gold;
                     break;
 
                 case ClaimStatus.AlreadyGranted:
                     _claim.text = "REWARD ALREADY CLAIMED";
-                    _claim.color = new Color(0.7f, 0.75f, 0.8f);
+                    _claim.color = Dim;
                     break;
 
                 case ClaimStatus.Pending:
                     // Pending is not an error. The claim is durable, and the vault replays it on the
                     // next launch, so the player is told to expect it rather than to retry.
-                    _claim.text = $"REWARD PENDING — WILL RETRY LATER ({record.Attempts} attempts)";
-                    _claim.color = new Color(0.95f, 0.8f, 0.4f);
+                    _claim.text = $"REWARD PENDING - WILL RETRY ({record.Attempts} ATTEMPTS)";
+                    _claim.color = Warn;
                     break;
 
                 case ClaimStatus.Failed:
-                    _claim.text = $"REWARD REFUSED ({record.Failure})";
-                    _claim.color = new Color(1f, 0.45f, 0.4f);
+                    // The failures are told apart rather than printed as one word. "The network was
+                    // down" and "the server said no" are the same colour of red to a HUD that only
+                    // prints record.Failure, and they are completely different news to a player.
+                    _claim.text = DescribeFailure(record.Failure);
+                    _claim.color = Bad;
                     break;
             }
+        }
+
+        static string DescribeFailure(ClaimFailure failure)
+        {
+            switch (failure)
+            {
+                case ClaimFailure.Rejected: return "REWARD REFUSED BY THE SERVER";
+                case ClaimFailure.Network: return "REWARD UNREACHABLE - RETRY AT NEXT LAUNCH";
+                case ClaimFailure.Parse: return "REWARD RESPONSE NOT UNDERSTOOD";
+                case ClaimFailure.Invalid: return "REWARD REQUEST WAS MALFORMED";
+                case ClaimFailure.Cancelled: return "REWARD CANCELLED - WILL RETRY";
+                default: return "REWARD FAILED";
+            }
+        }
+
+        void OnNotice(string message)
+        {
+            _notice.text = message;
+            _noticeUntil = Time.unscaledTime + NoticeSeconds;
+        }
+
+        /// <summary>
+        /// The shop button. It is offered only between runs — buying a level mid-roll would be a
+        /// modal decision on top of a physics sim — and <see cref="Vault.CanSpend"/>, not a
+        /// comparison written here, decides whether it is live.
+        /// </summary>
+        void RefreshUnlockButton()
+        {
+            if (!_level.HasNextLevel || _level.Phase == LevelPhase.Playing || _level.Phase == LevelPhase.Booting)
+            {
+                _unlock.Button.gameObject.SetActive(false);
+                return;
+            }
+
+            _unlock.Button.gameObject.SetActive(true);
+            _unlock.Label.text = $"UNLOCK NEXT LEVEL  -  {_level.NextUnlockCost} COINS";
+            _unlock.SetInteractable(_level.CanAffordNextLevel, Accent, new Color(0.14f, 0.17f, 0.23f));
+        }
+
+        // ------------------------------------------------------------------ vault panel
+
+        void ToggleVaultPanel()
+        {
+            var show = !_vaultPanel.activeSelf;
+            _vaultPanel.SetActive(show);
+
+            if (show)
+            {
+                _panelRefreshAt = Time.unscaledTime + PanelRefreshSeconds;
+                RefreshVaultPanel();
+            }
+        }
+
+        /// <summary>
+        /// Dumps everything the vault holds. This is the screen that makes the SDK's state
+        /// inspectable without a debugger: every declared balance with its ceiling, the player id the
+        /// save file is keyed by, and every claim that has not settled, with its attempt count.
+        /// </summary>
+        void RefreshVaultPanel()
+        {
+            var vault = _level.Vault;
+            if (vault == null)
+            {
+                _vaultText.text = "VAULT NOT OPEN YET";
+                return;
+            }
+
+            var builder = new StringBuilder();
+            builder.Append("PLAYER   ").AppendLine(vault.PlayerId);
+            builder.AppendLine();
+            builder.AppendLine("BALANCES");
+
+            foreach (var entry in vault.Balances)
+            {
+                var max = vault.GetMax(entry.Key);
+                builder.Append("  ").Append(entry.Key.ToUpperInvariant()).Append("  ").Append(entry.Value);
+                if (max.HasValue) builder.Append(" / ").Append(max.Value);
+                builder.AppendLine();
+            }
+
+            var pending = vault.PendingClaims;
+            builder.AppendLine();
+            builder.Append("PENDING CLAIMS  ").Append(pending.Count).AppendLine();
+
+            foreach (var record in pending)
+            {
+                builder.Append("  ").Append(record.RewardId)
+                    .Append("  +").Append(record.AmountRequested).Append(' ').Append(record.Resource)
+                    .Append("  ").Append(record.Attempts).AppendLine(" ATTEMPTS");
+            }
+
+            builder.AppendLine();
+            builder.AppendLine("CLEARED LEVELS");
+
+            for (var i = 0; i < _level.LevelCount; i++)
+            {
+                var id = LevelController.RewardIdFor(i);
+                var record = vault.GetClaim(id);
+                builder.Append("  ").Append(id).Append("  ")
+                    .AppendLine(record == null ? "NEVER" : record.Status.ToString().ToUpperInvariant());
+            }
+
+            _vaultText.text = builder.ToString();
+        }
+
+        // ------------------------------------------------------------------ construction
+
+        /// <summary>
+        /// uGUI buttons do nothing without an EventSystem, and this scene has no reason to carry one
+        /// in its hierarchy when the HUD that needs it builds itself. The input module assigns its
+        /// own default actions on enable, so nothing here has to author an input asset.
+        /// </summary>
+        static void EnsureEventSystem()
+        {
+            if (EventSystem.current != null) return;
+
+            var events = new GameObject("EventSystem", typeof(EventSystem));
+            events.AddComponent<InputSystemUIInputModule>();
         }
 
         void Build()
@@ -123,28 +361,157 @@ namespace CoinRush
             scaler.referenceResolution = new Vector2(ReferenceWidth, ReferenceHeight);
             scaler.matchWidthOrHeight = 0.5f;
 
-            _coins = CreateLabel(canvasObject.transform, "Coins", TextAnchor.UpperLeft,
-                anchorMin: new Vector2(0f, 1f), anchorMax: new Vector2(0.5f, 1f),
-                offsetMin: new Vector2(48f, -160f), offsetMax: new Vector2(0f, -48f), fontSize: 54);
+            var root = canvasObject.transform;
 
-            _lives = CreateLabel(canvasObject.transform, "Lives", TextAnchor.UpperRight,
-                anchorMin: new Vector2(0.5f, 1f), anchorMax: new Vector2(1f, 1f),
-                offsetMin: new Vector2(0f, -160f), offsetMax: new Vector2(-48f, -48f), fontSize: 54);
+            // Built first, so it sits at the back of the sibling order and every other widget wins
+            // the raycast against it. This is the whole reason the replay is a uGUI button rather
+            // than a pointer read: sorting, not frame ordering, decides who owns the tap.
+            _tapCatcher = CreateTapCatcher(root, _level.RequestReplay);
 
-            _banner = CreateLabel(canvasObject.transform, "Banner", TextAnchor.MiddleCenter,
-                anchorMin: new Vector2(0f, 0.5f), anchorMax: new Vector2(1f, 0.5f),
-                offsetMin: new Vector2(48f, -200f), offsetMax: new Vector2(-48f, 200f), fontSize: 72);
+            // A slab behind the top rows. Flat white text over a bright arena floor is unreadable at
+            // exactly the moment the player is looking at the arena instead of the numbers.
+            CreatePanel(root, "TopBar", Panel,
+                new Vector2(0f, 1f), new Vector2(1f, 1f),
+                new Vector2(0f, -280f), new Vector2(0f, 0f));
 
-            _claim = CreateLabel(canvasObject.transform, "Claim", TextAnchor.MiddleCenter,
-                anchorMin: new Vector2(0f, 0.5f), anchorMax: new Vector2(1f, 0.5f),
-                offsetMin: new Vector2(48f, -320f), offsetMax: new Vector2(-48f, -210f), fontSize: 40);
+            _coins = CreateLabel(root, "Coins", TextAnchor.UpperLeft,
+                new Vector2(0f, 1f), new Vector2(0.5f, 1f),
+                new Vector2(48f, -150f), new Vector2(0f, -40f), 54, Gold);
+
+            _lives = CreateLabel(root, "Lives", TextAnchor.UpperRight,
+                new Vector2(0.5f, 1f), new Vector2(1f, 1f),
+                new Vector2(0f, -150f), new Vector2(-48f, -40f), 54, Ink);
+
+            _levelLabel = CreateLabel(root, "Level", TextAnchor.UpperLeft,
+                new Vector2(0f, 1f), new Vector2(0.55f, 1f),
+                new Vector2(48f, -250f), new Vector2(0f, -160f), 38, Dim);
+
+            _pending = CreateLabel(root, "Pending", TextAnchor.UpperRight,
+                new Vector2(0.45f, 1f), new Vector2(1f, 1f),
+                new Vector2(0f, -250f), new Vector2(-48f, -160f), 38, Warn);
+
+            _banner = CreateLabel(root, "Banner", TextAnchor.MiddleCenter,
+                new Vector2(0f, 0.5f), new Vector2(1f, 0.5f),
+                new Vector2(48f, -190f), new Vector2(-48f, 190f), 72, Ink);
+
+            _claim = CreateLabel(root, "Claim", TextAnchor.MiddleCenter,
+                new Vector2(0f, 0.5f), new Vector2(1f, 0.5f),
+                new Vector2(48f, -310f), new Vector2(-48f, -200f), 38, Gold);
+
+            _notice = CreateLabel(root, "Notice", TextAnchor.LowerCenter,
+                new Vector2(0f, 0f), new Vector2(1f, 0f),
+                new Vector2(48f, 500f), new Vector2(-48f, 600f), 40, Warn);
+
+            _unlock = CreateButton(root, "Unlock", "UNLOCK NEXT LEVEL", Accent,
+                new Vector2(0f, 0f), new Vector2(1f, 0f),
+                new Vector2(72f, 310f), new Vector2(-72f, 470f), 42);
+            _unlock.Button.onClick.AddListener(_level.TryUnlockNextLevel);
+
+            _retry = CreateButton(root, "Retry", "RETRY PENDING", Warn,
+                new Vector2(0f, 0f), new Vector2(0.5f, 0f),
+                new Vector2(72f, 140f), new Vector2(-12f, 270f), 34);
+            _retry.Button.onClick.AddListener(_level.RetryPendingClaims);
+            _retry.Button.gameObject.SetActive(false);
+
+            _vaultToggle = CreateButton(root, "VaultToggle", "VAULT", new Color(0.18f, 0.22f, 0.3f),
+                new Vector2(0.5f, 0f), new Vector2(1f, 0f),
+                new Vector2(12f, 140f), new Vector2(-72f, 270f), 34);
+            _vaultToggle.Button.onClick.AddListener(ToggleVaultPanel);
+
+            BuildVaultPanel(root);
 
             _banner.text = string.Empty;
             _claim.text = string.Empty;
+            _notice.text = string.Empty;
+            _pending.text = string.Empty;
+            _levelLabel.text = string.Empty;
+            _unlock.Button.gameObject.SetActive(false);
+            _tapCatcher.gameObject.SetActive(false);
+        }
+
+        void BuildVaultPanel(Transform root)
+        {
+            // Built last so it sits on top of everything else in sibling order, and opaque enough to
+            // swallow taps that would otherwise reach the replay handler behind it.
+            var panel = CreatePanel(root, "VaultPanel", Scrim,
+                new Vector2(0f, 0f), new Vector2(1f, 1f), Vector2.zero, Vector2.zero);
+
+            panel.raycastTarget = true;
+            _vaultPanel = panel.gameObject;
+
+            CreateLabel(panel.transform, "Title", TextAnchor.UpperCenter,
+                new Vector2(0f, 1f), new Vector2(1f, 1f),
+                new Vector2(48f, -190f), new Vector2(-48f, -90f), 56, Ink);
+
+            _vaultText = CreateLabel(panel.transform, "Contents", TextAnchor.UpperLeft,
+                new Vector2(0f, 0f), new Vector2(1f, 1f),
+                new Vector2(72f, 320f), new Vector2(-72f, -220f), 34, Ink);
+
+            var close = CreateButton(panel.transform, "Close", "CLOSE", new Color(0.18f, 0.22f, 0.3f),
+                new Vector2(0f, 0f), new Vector2(1f, 0f),
+                new Vector2(72f, 140f), new Vector2(-72f, 270f), 40);
+            close.Button.onClick.AddListener(ToggleVaultPanel);
+
+            _vaultPanel.SetActive(false);
+        }
+
+        /// <summary>
+        /// A transparent, full-screen button. A fully transparent Image still takes raycasts — uGUI
+        /// only alpha-tests when a sprite and a hit threshold are set — so nothing has to be visible
+        /// for the tap to land.
+        /// </summary>
+        static Button CreateTapCatcher(Transform parent, UnityEngine.Events.UnityAction onClick)
+        {
+            var image = CreatePanel(parent, "TapCatcher", new Color(0f, 0f, 0f, 0f),
+                Vector2.zero, Vector2.one, Vector2.zero, Vector2.zero);
+
+            image.raycastTarget = true;
+
+            var button = image.gameObject.AddComponent<Button>();
+            button.targetGraphic = image;
+            button.transition = Selectable.Transition.None;   // No tint: the catcher must stay invisible.
+            button.onClick.AddListener(onClick);
+
+            return button;
+        }
+
+        static Image CreatePanel(Transform parent, string name, Color colour,
+            Vector2 anchorMin, Vector2 anchorMax, Vector2 offsetMin, Vector2 offsetMax)
+        {
+            var panel = new GameObject(name, typeof(Image));
+            panel.transform.SetParent(parent, worldPositionStays: false);
+
+            var rect = panel.GetComponent<RectTransform>();
+            rect.anchorMin = anchorMin;
+            rect.anchorMax = anchorMax;
+            rect.offsetMin = offsetMin;
+            rect.offsetMax = offsetMax;
+
+            var image = panel.GetComponent<Image>();
+            image.color = colour;
+            image.raycastTarget = false;
+
+            return image;
+        }
+
+        static ButtonView CreateButton(Transform parent, string name, string label, Color fill,
+            Vector2 anchorMin, Vector2 anchorMax, Vector2 offsetMin, Vector2 offsetMax, int fontSize)
+        {
+            var image = CreatePanel(parent, name, fill, anchorMin, anchorMax, offsetMin, offsetMax);
+            image.raycastTarget = true;
+
+            var button = image.gameObject.AddComponent<Button>();
+            button.targetGraphic = image;
+
+            var text = CreateLabel(image.transform, "Label", TextAnchor.MiddleCenter,
+                Vector2.zero, Vector2.one, Vector2.zero, Vector2.zero, fontSize, Color.white);
+
+            return new ButtonView { Button = button, Fill = image, Label = text };
         }
 
         static Text CreateLabel(Transform parent, string name, TextAnchor alignment,
-            Vector2 anchorMin, Vector2 anchorMax, Vector2 offsetMin, Vector2 offsetMax, int fontSize)
+            Vector2 anchorMin, Vector2 anchorMax, Vector2 offsetMin, Vector2 offsetMax,
+            int fontSize, Color colour)
         {
             var label = new GameObject(name, typeof(Text), typeof(Outline));
             label.transform.SetParent(parent, worldPositionStays: false);
@@ -159,9 +526,10 @@ namespace CoinRush
             text.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
             text.fontSize = fontSize;
             text.alignment = alignment;
-            text.color = Color.white;
+            text.color = colour;
             text.raycastTarget = false;
-            text.horizontalOverflow = HorizontalWrapMode.Overflow;
+            text.supportRichText = false;
+            text.horizontalOverflow = HorizontalWrapMode.Wrap;
             text.verticalOverflow = VerticalWrapMode.Overflow;
 
             var outline = label.GetComponent<Outline>();
