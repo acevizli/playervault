@@ -132,7 +132,18 @@ namespace CoinRush
         public event Action<long> CoinsChanged;
         public event Action<long> LivesChanged;
         public event Action<LevelPhase> PhaseChanged;
-        public event Action<ClaimRecord> ClaimChanged;
+        /// <summary>
+        /// Raised with the outcome of a claim and the record behind it.
+        /// </summary>
+        /// <remarks>
+        /// The status is carried separately from the record on purpose. A reward claimed a second
+        /// time comes back as <see cref="ClaimStatus.AlreadyGranted"/> wrapping the <i>original</i>
+        /// record, which is still <see cref="ClaimStatus.Granted"/> — correctly, because that is
+        /// what happened the first time. A listener that reads only the record therefore announces
+        /// a fresh grant on every replay, which is exactly the double-reward the SDK exists to
+        /// prevent, faked by the game on top of an SDK that refused it.
+        /// </remarks>
+        public event Action<ClaimStatus, ClaimRecord> ClaimChanged;
 
         /// <summary>Raised when the level being played changes, or is rebuilt.</summary>
         public event Action<LevelDefinition> LevelChanged;
@@ -224,7 +235,7 @@ namespace CoinRush
             Claim = _vault.GetClaim(RewardIdFor(CurrentIndex));
             if (Claim != null)
             {
-                ClaimChanged?.Invoke(Claim);
+                ClaimChanged?.Invoke(Claim.Status, Claim);
             }
 
             RefreshPendingClaims();
@@ -322,8 +333,10 @@ namespace CoinRush
                 ball.ResetToSpawn();
             }
 
+            // Read, but deliberately not announced. The claim for a level being replayed is last
+            // run's news, and re-raising it here is what left a "+100 COINS" banner sitting over the
+            // whole of the next run.
             Claim = _vault.GetClaim(RewardIdFor(CurrentIndex));
-            ClaimChanged?.Invoke(Claim);
 
             CoinsChanged?.Invoke(Coins);
             LivesChanged?.Invoke(Lives);
@@ -532,7 +545,7 @@ namespace CoinRush
             // state — ClaimStateChanged never fires for it. Reading the returned result is what makes
             // the second clear of the level say so rather than silently showing nothing.
             Claim = result.Record;
-            ClaimChanged?.Invoke(Claim);
+            ClaimChanged?.Invoke(result.Status, Claim);
             RefreshPendingClaims();
         }
 
@@ -557,7 +570,7 @@ namespace CoinRush
             }
 
             Claim = record;
-            ClaimChanged?.Invoke(record);
+            ClaimChanged?.Invoke(record.Status, record);
         }
 
         void RefreshPendingClaims()

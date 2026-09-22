@@ -25,6 +25,13 @@ namespace CoinRush
         const int ReferenceWidth = 1080;
         const int ReferenceHeight = 2340;
         const float NoticeSeconds = 2.5f;
+
+        /// <summary>
+        /// How long a settled reward stays on screen. Short on purpose: it is an event, not a
+        /// status, and the balance it moved is already on the top bar. Pending and failed claims
+        /// are not put on this timer — those are the ones worth reading.
+        /// </summary>
+        const float ClaimSeconds = 1f;
         const float PanelRefreshSeconds = 0.5f;
         const float RowHeight = 150f;
         const float RowPitch = 174f;
@@ -106,6 +113,7 @@ namespace CoinRush
         GameObject _menuPanel;
         GameObject _vaultPanel;
         float _noticeUntil;
+        float _claimUntil;
         float _panelRefreshAt;
 
         void Awake()
@@ -144,6 +152,12 @@ namespace CoinRush
             if (_notice.text.Length > 0 && Time.unscaledTime > _noticeUntil)
             {
                 _notice.text = string.Empty;
+            }
+
+            if (_claimUntil > 0f && Time.unscaledTime > _claimUntil)
+            {
+                _claim.text = string.Empty;
+                _claimUntil = 0f;
             }
 
             if (_vaultPanel.activeSelf && Time.unscaledTime >= _panelRefreshAt)
@@ -224,10 +238,16 @@ namespace CoinRush
                     break;
             }
 
+            // A run starting, by either route, wipes the previous run's reward line. Nothing about
+            // the last clear is worth saying while the ball is rolling again.
+            if (phase == LevelPhase.Menu || phase == LevelPhase.Playing)
+            {
+                ClearClaim();
+            }
+
             if (phase == LevelPhase.Menu)
             {
                 _levelLabel.text = string.Empty;
-                _claim.text = string.Empty;
             }
 
             _menuPanel.SetActive(phase == LevelPhase.Menu);
@@ -246,15 +266,24 @@ namespace CoinRush
         /// SDK to expose, and showing them verbatim is how the integration stays honest — a HUD that
         /// only knew "granted" would quietly hide the pending and clamped cases.
         /// </summary>
-        void OnClaimChanged(ClaimRecord record)
+        void OnClaimChanged(ClaimStatus status, ClaimRecord record)
         {
             if (record == null)
             {
-                _claim.text = string.Empty;
+                ClearClaim();
                 return;
             }
 
-            switch (record.Status)
+            // The status comes from the claim's outcome, not from the record. They differ on a
+            // replay — the outcome is AlreadyGranted while the record it wraps still says Granted,
+            // because that is the truth about the first time. Switching on the record would print
+            // "+100 COINS" every single clear, which is the SDK's guarantee being contradicted by
+            // the game that depends on it.
+            _claimUntil = status == ClaimStatus.Granted || status == ClaimStatus.AlreadyGranted
+                ? Time.unscaledTime + ClaimSeconds
+                : 0f;
+
+            switch (status)
             {
                 case ClaimStatus.Granted:
                     _claim.text = record.WasClamped
@@ -283,6 +312,12 @@ namespace CoinRush
                     _claim.color = Bad;
                     break;
             }
+        }
+
+        void ClearClaim()
+        {
+            _claim.text = string.Empty;
+            _claimUntil = 0f;
         }
 
         static string DescribeFailure(ClaimFailure failure)
@@ -577,7 +612,7 @@ namespace CoinRush
 
             CreateLabel(panel.transform, "Title", TextAnchor.UpperCenter,
                 new Vector2(0f, 1f), new Vector2(1f, 1f),
-                new Vector2(48f, -190f), new Vector2(-48f, -90f), 56, Ink);
+                new Vector2(48f, -190f), new Vector2(-48f, -90f), 56, Ink).text = "VAULT";
 
             _vaultText = CreateLabel(panel.transform, "Contents", TextAnchor.UpperLeft,
                 new Vector2(0f, 0f), new Vector2(1f, 1f),
@@ -644,6 +679,10 @@ namespace CoinRush
             var text = CreateLabel(image.transform, "Label", TextAnchor.MiddleCenter,
                 Vector2.zero, Vector2.one, new Vector2(24f, 8f), new Vector2(-24f, -8f),
                 fontSize, Color.white);
+
+            // Every button that is not refreshed from state — LEVELS, VAULT, RETRY, CLOSE — got its
+            // caption from here and nowhere else, so dropping this line left them blank.
+            text.text = label;
 
             var view = new ButtonView { Button = button, Fill = image, Label = text };
             view.Tint(fill);
