@@ -101,12 +101,8 @@ namespace CoinRush
             if (vaultBehaviour != null)
             {
                 vaultBehaviour.Opened -= OnVaultOpened;
-            }
-
-            if (_vault != null)
-            {
-                _vault.BalanceChanged -= OnBalanceChanged;
-                _vault.ClaimStateChanged -= OnClaimStateChanged;
+                vaultBehaviour.BalanceChanged -= OnBalanceChanged;
+                vaultBehaviour.ClaimStateChanged -= OnClaimStateChanged;
             }
 
             UnsubscribeFromLevel();
@@ -131,8 +127,12 @@ namespace CoinRush
         void OnVaultOpened(Vault vault)
         {
             _vault = vault;
-            _vault.BalanceChanged += OnBalanceChanged;
-            _vault.ClaimStateChanged += OnClaimStateChanged;
+
+            // Subscribed on the wrapper, not on the vault itself. The vault raises its events on
+            // whichever thread finished the work, and these handlers end up writing HUD text — which
+            // is a main-thread-only operation. VaultBehaviour re-raises them on the main thread.
+            vaultBehaviour.BalanceChanged += OnBalanceChanged;
+            vaultBehaviour.ClaimStateChanged += OnClaimStateChanged;
 
             // A claim left unfinished by an earlier session is already being replayed by now — the
             // vault resumes on open. Surface whatever it knows so the HUD is honest from frame one.
@@ -254,23 +254,26 @@ namespace CoinRush
             }
         }
 
-        async void CompleteLevel()
+        void CompleteLevel()
         {
             Freeze();
             SetPhase(LevelPhase.Completed);
 
-            try
-            {
-                var result = await _vault.ClaimAsync(FirstClearReward, CoinsResource, firstClearReward);
-                Claim = result.Record;
-                ClaimChanged?.Invoke(Claim);
-            }
-            catch (Exception exception)
-            {
-                // ClaimAsync returns failures rather than throwing, so anything landing here is a bug
-                // rather than a network condition — and an unobserved async void exception is silent.
-                Debug.LogException(exception);
-            }
+            // The coroutine bridge rather than `await vault.ClaimAsync(...)`. Awaiting directly is
+            // fine for the claim itself, but the continuation resumes on the thread pool, and the
+            // first thing this wants to do with the result is put it on screen. A coroutine is driven
+            // by Unity's own loop, so the callback is on the main thread by construction.
+            StartCoroutine(vaultBehaviour.ClaimRoutine(
+                FirstClearReward, CoinsResource, firstClearReward, OnClaimCompleted));
+        }
+
+        void OnClaimCompleted(ClaimResult result)
+        {
+            // AlreadyGranted returns without sending a request, and so without moving the claim's
+            // state — ClaimStateChanged never fires for it. Reading the returned result is what makes
+            // the second clear of the level say so rather than silently showing nothing.
+            Claim = result.Record;
+            ClaimChanged?.Invoke(Claim);
         }
 
         void OnBalanceChanged(string resource, long balance)

@@ -61,10 +61,21 @@ namespace PlayerVault
 
         public string PlayerId => _config.PlayerId;
 
-        /// <summary>Raised after a balance change has been committed. (resource, new balance)</summary>
+        /// <summary>
+        /// Raised after a balance change has been committed. (resource, new balance)
+        /// </summary>
+        /// <remarks>
+        /// <b>Raised on whichever thread completed the work</b>, which for anything downstream of a
+        /// claim is a thread-pool thread, not Unity's main thread. That is the correct behaviour for
+        /// a plain C# object — it does not know what an engine is — but it means a handler that
+        /// touches a <c>GameObject</c>, a <c>Transform</c> or a UI graphic will throw. Subscribe to
+        /// <see cref="VaultBehaviour"/>'s event of the same name instead, which re-raises this one
+        /// on the main thread.
+        /// </remarks>
         public event Action<string, long> BalanceChanged;
 
         /// <summary>Raised whenever a claim moves. Useful for driving UI without polling.</summary>
+        /// <remarks>Same threading caveat as <see cref="BalanceChanged"/>.</remarks>
         public event Action<ClaimRecord> ClaimStateChanged;
 
         /// <summary>
