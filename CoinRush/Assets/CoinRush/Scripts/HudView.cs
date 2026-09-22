@@ -9,7 +9,8 @@ namespace CoinRush
 {
     /// <summary>
     /// The heads-up display: balances, the level being played, the state of the reward claim, the
-    /// shop button for the next level, and an inspector panel showing the vault's whole contents.
+    /// level select — which doubles as the shop — and an inspector panel showing the vault's whole
+    /// contents.
     ///
     /// The canvas is built in <see cref="Awake"/> rather than authored in the scene. A dozen widgets
     /// do not justify hand-placing a Canvas, a scaler and a rect transform each, and every one of
@@ -25,6 +26,8 @@ namespace CoinRush
         const int ReferenceHeight = 2340;
         const float NoticeSeconds = 2.5f;
         const float PanelRefreshSeconds = 0.5f;
+        const float RowHeight = 150f;
+        const float RowPitch = 174f;
 
         static readonly Color Ink = new Color(0.96f, 0.97f, 1f);
         static readonly Color Dim = new Color(0.62f, 0.68f, 0.78f);
@@ -34,6 +37,9 @@ namespace CoinRush
         static readonly Color Accent = new Color(0.16f, 0.62f, 0.98f);
         static readonly Color Panel = new Color(0.05f, 0.07f, 0.11f, 0.72f);
         static readonly Color Scrim = new Color(0.03f, 0.04f, 0.07f, 0.94f);
+        static readonly Color Owned = new Color(0.13f, 0.28f, 0.42f);
+        static readonly Color Affordable = new Color(0.32f, 0.25f, 0.07f);
+        static readonly Color Locked = new Color(0.11f, 0.13f, 0.18f);
 
         /// <summary>
         /// A button and the label on it.
@@ -72,6 +78,13 @@ namespace CoinRush
             }
         }
 
+        /// <summary>One line of the level select: the button, its name, and its right-hand state.</summary>
+        sealed class LevelRow
+        {
+            public ButtonView View;
+            public Text State;
+        }
+
         LevelController _level;
 
         Text _coins;
@@ -83,11 +96,14 @@ namespace CoinRush
         Text _notice;
         Text _vaultText;
 
-        ButtonView _unlock;
+        ButtonView _levelsButton;
         ButtonView _vaultToggle;
         ButtonView _retry;
         Button _tapCatcher;
 
+        LevelRow[] _rows;
+
+        GameObject _menuPanel;
         GameObject _vaultPanel;
         float _noticeUntil;
         float _panelRefreshAt;
@@ -107,6 +123,7 @@ namespace CoinRush
             _level.ClaimChanged += OnClaimChanged;
             _level.LevelChanged += OnLevelChanged;
             _level.PendingClaimsChanged += OnPendingClaimsChanged;
+            _level.UnlocksChanged += RefreshMenu;
             _level.Notice += OnNotice;
         }
 
@@ -118,6 +135,7 @@ namespace CoinRush
             _level.ClaimChanged -= OnClaimChanged;
             _level.LevelChanged -= OnLevelChanged;
             _level.PendingClaimsChanged -= OnPendingClaimsChanged;
+            _level.UnlocksChanged -= RefreshMenu;
             _level.Notice -= OnNotice;
         }
 
@@ -140,7 +158,11 @@ namespace CoinRush
         void OnCoinsChanged(long value)
         {
             _coins.text = $"COINS  {value}";
-            RefreshUnlockButton();
+
+            // The menu is also the shop, so every coin picked up can flip a row from unaffordable
+            // to buyable. Asking the vault again is cheaper than tracking which rows might have
+            // changed, and it keeps CanSpend the single authority on what the player can afford.
+            RefreshMenu();
         }
 
         /// <summary>
@@ -159,8 +181,6 @@ namespace CoinRush
             _levelLabel.text = level == null
                 ? string.Empty
                 : $"LEVEL {_level.CurrentIndex + 1}/{_level.LevelCount}  {level.name.ToUpperInvariant()}";
-
-            RefreshUnlockButton();
         }
 
         /// <summary>
@@ -187,6 +207,10 @@ namespace CoinRush
         {
             switch (phase)
             {
+                case LevelPhase.Booting:
+                    _banner.text = "OPENING VAULT";
+                    break;
+
                 case LevelPhase.Completed:
                     _banner.text = "LEVEL COMPLETE\nTAP TO PLAY AGAIN";
                     break;
@@ -200,11 +224,21 @@ namespace CoinRush
                     break;
             }
 
-            // Only live between runs. While the ball is rolling the catcher would sit in front of
-            // nothing that matters, but leaving it enabled is one more surface to reason about.
-            _tapCatcher.gameObject.SetActive(phase == LevelPhase.Completed || phase == LevelPhase.GameOver);
+            if (phase == LevelPhase.Menu)
+            {
+                _levelLabel.text = string.Empty;
+                _claim.text = string.Empty;
+            }
 
-            RefreshUnlockButton();
+            _menuPanel.SetActive(phase == LevelPhase.Menu);
+            if (phase == LevelPhase.Menu) RefreshMenu();
+
+            // The replay catcher and the way back to the menu are only live between runs. While the
+            // ball is rolling they would sit in front of nothing that matters, but leaving them
+            // enabled is one more surface to reason about.
+            var between = phase == LevelPhase.Completed || phase == LevelPhase.GameOver;
+            _tapCatcher.gameObject.SetActive(between);
+            _levelsButton.Button.gameObject.SetActive(between);
         }
 
         /// <summary>
@@ -270,22 +304,49 @@ namespace CoinRush
             _noticeUntil = Time.unscaledTime + NoticeSeconds;
         }
 
-        /// <summary>
-        /// The shop button. It is offered only between runs — buying a level mid-roll would be a
-        /// modal decision on top of a physics sim — and <see cref="Vault.CanSpend"/>, not a
-        /// comparison written here, decides whether it is live.
-        /// </summary>
-        void RefreshUnlockButton()
-        {
-            if (!_level.HasNextLevel || _level.Phase == LevelPhase.Playing || _level.Phase == LevelPhase.Booting)
-            {
-                _unlock.Button.gameObject.SetActive(false);
-                return;
-            }
+        // ------------------------------------------------------------------ level select
 
-            _unlock.Button.gameObject.SetActive(true);
-            _unlock.Label.text = $"UNLOCK NEXT LEVEL  -  {_level.NextUnlockCost} COINS";
-            _unlock.SetInteractable(_level.CanAffordNextLevel, Accent, new Color(0.14f, 0.17f, 0.23f));
+        /// <summary>
+        /// Redraws every row of the level select. Each row asks the vault what it is: owned levels
+        /// play, locked ones show their price, and <see cref="Vault.CanSpend"/> — not a comparison
+        /// written here — decides which of those prices is live. Rewriting all five is cheaper than
+        /// working out which one changed, and it means there is one code path producing the state.
+        /// </summary>
+        void RefreshMenu()
+        {
+            if (_rows == null) return;
+
+            for (var i = 0; i < _rows.Length; i++)
+            {
+                var row = _rows[i];
+                row.View.Label.text = $"{i + 1}   {_level.LevelAt(i).name.ToUpperInvariant()}";
+
+                if (_level.IsUnlocked(i))
+                {
+                    row.View.SetInteractable(true, i == _level.CurrentIndex ? Accent : Owned, Owned);
+                    row.State.text = "PLAY";
+                    row.State.color = Ink;
+                    continue;
+                }
+
+                var cost = _level.UnlockCostOf(i);
+                var affordable = _level.CanAfford(i);
+
+                row.View.SetInteractable(affordable, Affordable, Locked);
+                row.State.text = affordable ? $"BUY  {cost}" : $"{cost} COINS";
+                row.State.color = affordable ? Gold : Dim;
+            }
+        }
+
+        /// <summary>
+        /// One tap, two meanings — but never both. A locked row buys; an owned row plays. Buying
+        /// does start the level it just bought, which is the only place the two meet, and that is a
+        /// deliberate convenience rather than a tap doing something the label did not promise.
+        /// </summary>
+        void OnLevelRowClicked(int index)
+        {
+            if (_level.IsUnlocked(index)) _level.SelectLevel(index);
+            else _level.TryUnlock(index);
         }
 
         // ------------------------------------------------------------------ vault panel
@@ -341,13 +402,14 @@ namespace CoinRush
             }
 
             builder.AppendLine();
-            builder.AppendLine("CLEARED LEVELS");
+            builder.AppendLine("LEVELS");
 
             for (var i = 0; i < _level.LevelCount; i++)
             {
-                var id = LevelController.RewardIdFor(i);
-                var record = vault.GetClaim(id);
-                builder.Append("  ").Append(id).Append("  ")
+                var record = vault.GetClaim(LevelController.RewardIdFor(i));
+                builder.Append("  ").Append(i + 1).Append("  ")
+                    .Append(_level.IsUnlocked(i) ? "OWNED " : "LOCKED")
+                    .Append("  REWARD ")
                     .AppendLine(record == null ? "NEVER" : record.Status.ToString().ToUpperInvariant());
             }
 
@@ -422,12 +484,12 @@ namespace CoinRush
 
             _notice = CreateLabel(root, "Notice", TextAnchor.LowerCenter,
                 new Vector2(0f, 0f), new Vector2(1f, 0f),
-                new Vector2(48f, 500f), new Vector2(-48f, 600f), 40, Warn);
+                new Vector2(48f, 440f), new Vector2(-48f, 530f), 40, Warn);
 
-            _unlock = CreateButton(root, "Unlock", "UNLOCK NEXT LEVEL", Accent,
+            _levelsButton = CreateButton(root, "Levels", "LEVELS", Accent,
                 new Vector2(0f, 0f), new Vector2(1f, 0f),
-                new Vector2(72f, 310f), new Vector2(-72f, 470f), 42);
-            _unlock.Button.onClick.AddListener(_level.TryUnlockNextLevel);
+                new Vector2(72f, 290f), new Vector2(-72f, 420f), 42);
+            _levelsButton.Button.onClick.AddListener(_level.ShowMenu);
 
             _retry = CreateButton(root, "Retry", "RETRY PENDING", Warn,
                 new Vector2(0f, 0f), new Vector2(0.5f, 0f),
@@ -440,15 +502,67 @@ namespace CoinRush
                 new Vector2(12f, 140f), new Vector2(-72f, 270f), 34);
             _vaultToggle.Button.onClick.AddListener(ToggleVaultPanel);
 
+            BuildMenu(root);
             BuildVaultPanel(root);
 
-            _banner.text = string.Empty;
+            // The vault opens asynchronously, so the first thing on screen is a statement that
+            // something is happening rather than an empty arena the player cannot steer.
+            _banner.text = "OPENING VAULT";
             _claim.text = string.Empty;
             _notice.text = string.Empty;
             _pending.text = string.Empty;
             _levelLabel.text = string.Empty;
-            _unlock.Button.gameObject.SetActive(false);
+            _levelsButton.Button.gameObject.SetActive(false);
             _tapCatcher.gameObject.SetActive(false);
+        }
+
+        /// <summary>
+        /// The level select. It deliberately stops short of the top bar and the bottom button row
+        /// rather than covering the screen: coins stay readable while shopping, and the notice line
+        /// that says why a purchase was refused has to be visible at the moment it is refused.
+        /// </summary>
+        void BuildMenu(Transform root)
+        {
+            var panel = CreatePanel(root, "MenuPanel", Scrim,
+                new Vector2(0f, 0f), new Vector2(1f, 1f),
+                new Vector2(0f, 560f), new Vector2(0f, -280f));
+
+            panel.raycastTarget = true;
+            _menuPanel = panel.gameObject;
+
+            var title = CreateLabel(panel.transform, "Title", TextAnchor.UpperCenter,
+                new Vector2(0f, 1f), new Vector2(1f, 1f),
+                new Vector2(48f, -130f), new Vector2(-48f, -30f), 52, Ink);
+            title.text = "SELECT A LEVEL";
+
+            _rows = new LevelRow[_level.LevelCount];
+            for (var i = 0; i < _rows.Length; i++)
+            {
+                _rows[i] = CreateLevelRow(panel.transform, i, 160f + i * RowPitch);
+            }
+
+            _menuPanel.SetActive(false);
+        }
+
+        LevelRow CreateLevelRow(Transform parent, int index, float top)
+        {
+            var view = CreateButton(parent, $"Level{index + 1}", string.Empty, Locked,
+                new Vector2(0f, 1f), new Vector2(1f, 1f),
+                new Vector2(48f, -(top + RowHeight)), new Vector2(-48f, -top), 42);
+
+            // The shared label is pushed left and given room on the right for the state, so a long
+            // level name cannot run underneath its own price.
+            view.Label.alignment = TextAnchor.MiddleLeft;
+            view.Label.rectTransform.offsetMax = new Vector2(-300f, -8f);
+
+            var state = CreateLabel(view.Button.transform, "State", TextAnchor.MiddleRight,
+                Vector2.zero, Vector2.one, new Vector2(24f, 8f), new Vector2(-32f, -8f), 36, Ink);
+
+            // Captured once: the loop variable would otherwise be shared by every listener.
+            var captured = index;
+            view.Button.onClick.AddListener(() => OnLevelRowClicked(captured));
+
+            return new LevelRow { View = view, State = state };
         }
 
         void BuildVaultPanel(Transform root)

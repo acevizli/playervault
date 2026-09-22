@@ -1303,10 +1303,22 @@ MonoBehaviour:
     initial: 3
     hasMax: 1
     max: 3
-  - key: levels
-    initial: 1
+  - key: level-2-unlocked
+    initial: 0
     hasMax: 1
-    max: 5
+    max: 1
+  - key: level-3-unlocked
+    initial: 0
+    hasMax: 1
+    max: 1
+  - key: level-4-unlocked
+    initial: 0
+    hasMax: 1
+    max: 1
+  - key: level-5-unlocked
+    initial: 0
+    hasMax: 1
+    max: 1
   openOnAwake: 1
   allowUndeclaredResources: 0
   flushOnApplicationPause: 1
