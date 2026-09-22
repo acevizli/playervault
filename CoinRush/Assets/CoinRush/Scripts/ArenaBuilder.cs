@@ -22,6 +22,9 @@ namespace CoinRush
         [SerializeField] float hazardSize = 1.4f;
         [SerializeField] Material hazardMaterial;
 
+        [Tooltip("Hazards turn back at this distance from the centre. Keep it inside the walls.")]
+        [SerializeField] float hazardWanderRadius = 12.5f;
+
         readonly List<Coin> _coins = new List<Coin>();
         readonly List<Hazard> _hazards = new List<Hazard>();
 
@@ -46,20 +49,24 @@ namespace CoinRush
                 _coins.Add(CreateCoin(PointOnRing(i, level.coinCount, level.coinRingRadius, coinHeight)));
             }
 
-            // Hazards hang off their own container so the whole ring can be orbited as one rigid
-            // body. It also keeps the coins still while the hazards move.
+            // Hazards share a container purely for tidiness in the hierarchy. Each one steers
+            // itself, so there is nothing for a parent transform to drive.
             var hazardRoot = new GameObject("Hazards").transform;
             hazardRoot.SetParent(_container, worldPositionStays: false);
-            hazardRoot.gameObject.AddComponent<Rotator>().degreesPerSecond = level.hazardOrbitDegreesPerSecond;
 
             for (var i = 0; i < level.hazardCount; i++)
             {
-                // Offset by half a step so hazards sit between coins rather than under them.
+                // Spawned evenly on a ring, offset half a step so they do not start on top of the
+                // coins. Where they go after that is their own business.
                 const float angleOffset = 0.5f;
                 var position = PointOnRing(
                     i + angleOffset, level.hazardCount, level.hazardRingRadius, hazardSize * 0.5f);
 
-                _hazards.Add(CreateHazard(hazardRoot, position));
+                var hazard = CreateHazard(hazardRoot, position);
+                hazard.GetComponent<HazardMotion>()
+                    .Launch(level.hazardSpeed, hazardWanderRadius, level.hazardTurnSeconds);
+
+                _hazards.Add(hazard);
             }
         }
 
@@ -119,6 +126,15 @@ namespace CoinRush
             // A trigger, not a solid body: bouncing off a hazard and losing a life at the same time
             // reads as two punishments for one mistake.
             block.GetComponent<BoxCollider>().isTrigger = true;
+
+            // Kinematic body on a collider that moves every frame. Without one the physics engine
+            // treats it as static geometry and rebuilds its broadphase tree on every step, which is
+            // the documented way to make a dozen drifting triggers cost more than the whole game.
+            var body = block.AddComponent<Rigidbody>();
+            body.isKinematic = true;
+            body.useGravity = false;
+
+            block.AddComponent<HazardMotion>();
 
             return block.AddComponent<Hazard>();
         }

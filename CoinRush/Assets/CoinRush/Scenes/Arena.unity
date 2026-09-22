@@ -1204,6 +1204,7 @@ MonoBehaviour:
   coinMaterial: {fileID: 2100000, guid: cf75edbbbe984db9b09c64ba39e8ee13, type: 2}
   hazardSize: 1.4
   hazardMaterial: {fileID: 2100000, guid: d74667c9ce984ddbb763d7f1768e1bf2, type: 2}
+  hazardWanderRadius: 12.5
 --- !u!114 &1900000004
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1225,25 +1226,46 @@ MonoBehaviour:
     coinRingRadius: 9
     hazardCount: 3
     hazardRingRadius: 5.5
-    hazardOrbitDegreesPerSecond: 0
+    hazardSpeed: 0
+    hazardTurnSeconds: 2
     unlockCost: 0
     firstClearReward: 100
   - name: CROSSFIRE
     coinCount: 12
     coinRingRadius: 10.5
-    hazardCount: 6
+    hazardCount: 5
     hazardRingRadius: 6
-    hazardOrbitDegreesPerSecond: 26
+    hazardSpeed: 2.6
+    hazardTurnSeconds: 2.5
     unlockCost: 150
     firstClearReward: 200
   - name: GAUNTLET
-    coinCount: 16
-    coinRingRadius: 12
-    hazardCount: 9
+    coinCount: 14
+    coinRingRadius: 11.5
+    hazardCount: 7
     hazardRingRadius: 6.5
-    hazardOrbitDegreesPerSecond: -42
+    hazardSpeed: 3.4
+    hazardTurnSeconds: 2
     unlockCost: 400
     firstClearReward: 350
+  - name: SWARM
+    coinCount: 16
+    coinRingRadius: 12
+    hazardCount: 10
+    hazardRingRadius: 7
+    hazardSpeed: 4.2
+    hazardTurnSeconds: 1.6
+    unlockCost: 700
+    firstClearReward: 500
+  - name: MAELSTROM
+    coinCount: 20
+    coinRingRadius: 12.5
+    hazardCount: 13
+    hazardRingRadius: 7.5
+    hazardSpeed: 5.2
+    hazardTurnSeconds: 1.2
+    unlockCost: 800
+    firstClearReward: 800
   livesPerRun: 3
   coinsPerPickup: 10
 --- !u!114 &1900000005
@@ -1284,7 +1306,7 @@ MonoBehaviour:
   - key: levels
     initial: 1
     hasMax: 1
-    max: 3
+    max: 5
   openOnAwake: 1
   allowUndeclaredResources: 0
   flushOnApplicationPause: 1

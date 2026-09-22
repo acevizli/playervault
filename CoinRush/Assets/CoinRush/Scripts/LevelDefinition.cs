@@ -23,8 +23,11 @@ namespace CoinRush
         public int hazardCount = 3;
         public float hazardRingRadius = 5.5f;
 
-        [Tooltip("Hazards orbit the arena at this rate. Zero leaves them parked.")]
-        public float hazardOrbitDegreesPerSecond;
+        [Tooltip("How fast hazards wander, in units per second. Zero leaves them parked.")]
+        public float hazardSpeed;
+
+        [Tooltip("Average seconds between a wandering hazard's course changes. Lower is more erratic.")]
+        public float hazardTurnSeconds = 2f;
 
         [Header("Economy")]
         [Tooltip("Coins spent to unlock this level. Ignored for the first level, which is always open.")]
