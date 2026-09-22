@@ -1,4 +1,5 @@
 using System;
+using PlayerVault;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
@@ -7,42 +8,63 @@ namespace CoinRush
     /// <summary>The phase the level is in. Drives what the HUD shows and whether input matters.</summary>
     public enum LevelPhase
     {
+        /// <summary>The vault has not finished opening. Nothing is playable yet.</summary>
+        Booting,
         Playing,
         Completed,
         GameOver
     }
 
     /// <summary>
-    /// Owns the game's state: how many coins have been banked, how many lives are left, and whether
-    /// the level is still running.
+    /// Owns the run: laying out the level, reacting to pickups and deaths, and deciding when the run
+    /// is over.
     ///
-    /// Note that the counters below are plain <c>int</c> fields belonging to CoinRush. PlayerVault is
-    /// not referenced anywhere in this class, on purpose — the game is written first as a game would
-    /// be written, and the SDK takes ownership of these two numbers later. Doing it in that order is
-    /// the only way to find out whether the SDK actually integrates, rather than having been quietly
-    /// designed into the game from birth.
+    /// It no longer owns the *numbers*. Coins and lives are PlayerVault resources now, so this class
+    /// reads balances rather than tracking them, and every change to a balance arrives back through
+    /// <see cref="Vault.BalanceChanged"/> rather than being pushed out from here. That inversion is
+    /// what lets a pending claim replayed at launch — from a session that was offline when the level
+    /// was cleared — move the HUD without a single line of game code being involved.
     /// </summary>
     public sealed class LevelController : MonoBehaviour
     {
+        /// <summary>Resource keys. Declared on the VaultBehaviour in the scene; these must match.</summary>
+        public const string CoinsResource = "coins";
+        public const string LivesResource = "lives";
+
+        /// <summary>
+        /// The reward id. Stable and specific: it identifies *this* milestone for *this* level, so it
+        /// stays meaningful when a second level shows up. The vault grants it exactly once per player,
+        /// forever, across reinstalls of the scene and restarts of the app.
+        /// </summary>
+        public const string FirstClearReward = "level-complete-first-time";
+
+        [Header("Scene")]
         [SerializeField] BallController ball;
         [SerializeField] ArenaBuilder arena;
-        [SerializeField] int startingLives = 3;
-        [SerializeField] int coinsPerPickup = 10;
+        [SerializeField] VaultBehaviour vaultBehaviour;
 
-        /// <summary>Coins banked this run.</summary>
-        public int Coins { get; private set; }
+        [Header("Economy")]
+        [SerializeField] int livesPerRun = 3;
+        [SerializeField] long coinsPerPickup = 10;
+        [SerializeField] long firstClearReward = 100;
 
-        /// <summary>Lives remaining.</summary>
-        public int Lives { get; private set; }
+        Vault _vault;
 
-        /// <summary>Coins still on the board.</summary>
+        /// <summary>Coins still on the board this run.</summary>
         public int CoinsRemaining { get; private set; }
 
-        public LevelPhase Phase { get; private set; } = LevelPhase.Playing;
+        public LevelPhase Phase { get; private set; } = LevelPhase.Booting;
 
-        public event Action<int> CoinsChanged;
-        public event Action<int> LivesChanged;
+        /// <summary>The most recent claim, or null if the level has never been cleared this session.</summary>
+        public ClaimRecord Claim { get; private set; }
+
+        public long Coins => _vault?.GetBalance(CoinsResource) ?? 0;
+        public long Lives => _vault?.GetBalance(LivesResource) ?? 0;
+
+        public event Action<long> CoinsChanged;
+        public event Action<long> LivesChanged;
         public event Action<LevelPhase> PhaseChanged;
+        public event Action<ClaimRecord> ClaimChanged;
 
         void Start()
         {
@@ -51,7 +73,22 @@ namespace CoinRush
                 ball.Fell += OnBallFell;
             }
 
-            StartRun();
+            if (vaultBehaviour == null)
+            {
+                Debug.LogError("[CoinRush] No VaultBehaviour assigned — the game cannot track resources.");
+                return;
+            }
+
+            // IsOpen is checked before subscribing because VaultBehaviour sets Vault and raises Opened
+            // back to back; a listener attached afterwards would wait for an event that already fired.
+            if (vaultBehaviour.IsOpen)
+            {
+                OnVaultOpened(vaultBehaviour.Vault);
+            }
+            else
+            {
+                vaultBehaviour.Opened += OnVaultOpened;
+            }
         }
 
         void OnDestroy()
@@ -61,12 +98,23 @@ namespace CoinRush
                 ball.Fell -= OnBallFell;
             }
 
+            if (vaultBehaviour != null)
+            {
+                vaultBehaviour.Opened -= OnVaultOpened;
+            }
+
+            if (_vault != null)
+            {
+                _vault.BalanceChanged -= OnBalanceChanged;
+                _vault.ClaimStateChanged -= OnClaimStateChanged;
+            }
+
             UnsubscribeFromLevel();
         }
 
         void Update()
         {
-            if (Phase == LevelPhase.Playing)
+            if (Phase == LevelPhase.Playing || Phase == LevelPhase.Booting)
             {
                 return;
             }
@@ -80,11 +128,35 @@ namespace CoinRush
             }
         }
 
-        /// <summary>Resets every counter and lays out a fresh level.</summary>
+        void OnVaultOpened(Vault vault)
+        {
+            _vault = vault;
+            _vault.BalanceChanged += OnBalanceChanged;
+            _vault.ClaimStateChanged += OnClaimStateChanged;
+
+            // A claim left unfinished by an earlier session is already being replayed by now — the
+            // vault resumes on open. Surface whatever it knows so the HUD is honest from frame one.
+            Claim = _vault.GetClaim(FirstClearReward);
+            if (Claim != null)
+            {
+                ClaimChanged?.Invoke(Claim);
+            }
+
+            StartRun();
+        }
+
+        /// <summary>Tops lives back up and lays out a fresh level.</summary>
         public void StartRun()
         {
-            Coins = 0;
-            Lives = startingLives;
+            if (_vault == null)
+            {
+                return;
+            }
+
+            // Grant the full allowance and let the resource maximum absorb the excess rather than
+            // computing the difference here. The SDK already knows the ceiling; duplicating that
+            // arithmetic in the game is how the two drift apart.
+            _vault.GrantLocal(LivesResource, livesPerRun);
 
             BuildLevel();
             SetPhase(LevelPhase.Playing);
@@ -142,16 +214,15 @@ namespace CoinRush
                 return;
             }
 
-            Coins += coinsPerPickup;
+            // A pickup is a local grant, not a claim. Nothing server-side authorises picking up a coin
+            // that the game itself just spawned, and routing it through the network would make the
+            // whole economy hostage to connectivity.
+            _vault.GrantLocal(CoinsResource, coinsPerPickup);
             CoinsRemaining--;
-            CoinsChanged?.Invoke(Coins);
 
             if (CoinsRemaining <= 0)
             {
-                // The hook. When PlayerVault lands, this is where the reward claim fires — the arena
-                // being cleared is the event a server would be told about.
-                Freeze();
-                SetPhase(LevelPhase.Completed);
+                CompleteLevel();
             }
         }
 
@@ -166,10 +237,11 @@ namespace CoinRush
                 return;
             }
 
-            Lives--;
-            LivesChanged?.Invoke(Lives);
+            var result = _vault.Spend(LivesResource, 1);
 
-            if (Lives <= 0)
+            // A refused spend is the authoritative "no lives left" answer — the vault, not the game,
+            // decides whether the balance covers it.
+            if (!result.Success || result.Balance <= 0)
             {
                 Freeze();
                 SetPhase(LevelPhase.GameOver);
@@ -180,6 +252,42 @@ namespace CoinRush
             {
                 ball.ResetToSpawn();
             }
+        }
+
+        async void CompleteLevel()
+        {
+            Freeze();
+            SetPhase(LevelPhase.Completed);
+
+            try
+            {
+                var result = await _vault.ClaimAsync(FirstClearReward, CoinsResource, firstClearReward);
+                Claim = result.Record;
+                ClaimChanged?.Invoke(Claim);
+            }
+            catch (Exception exception)
+            {
+                // ClaimAsync returns failures rather than throwing, so anything landing here is a bug
+                // rather than a network condition — and an unobserved async void exception is silent.
+                Debug.LogException(exception);
+            }
+        }
+
+        void OnBalanceChanged(string resource, long balance)
+        {
+            if (resource == CoinsResource) CoinsChanged?.Invoke(balance);
+            else if (resource == LivesResource) LivesChanged?.Invoke(balance);
+        }
+
+        void OnClaimStateChanged(ClaimRecord record)
+        {
+            if (record.RewardId != FirstClearReward)
+            {
+                return;
+            }
+
+            Claim = record;
+            ClaimChanged?.Invoke(record);
         }
 
         void Freeze()

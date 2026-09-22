@@ -1165,6 +1165,7 @@ GameObject:
   - component: {fileID: 1900000003}
   - component: {fileID: 1900000004}
   - component: {fileID: 1900000005}
+  - component: {fileID: 1900000006}
   m_Layer: 0
   m_Name: Game
   m_TagString: Untagged
@@ -1221,8 +1222,10 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::CoinRush.LevelController
   ball: {fileID: 869454263}
   arena: {fileID: 1900000003}
-  startingLives: 3
+  vaultBehaviour: {fileID: 1900000006}
+  livesPerRun: 3
   coinsPerPickup: 10
+  firstClearReward: 100
 --- !u!114 &1900000005
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1235,6 +1238,32 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 76c4d564335441f78135d781dfc7a7f2, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::CoinRush.HudView
+--- !u!114 &1900000006
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1900000001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: fbf34da2bc8344fe0916f21874823e90, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: PlayerVault.Runtime::PlayerVault.VaultBehaviour
+  playerId: test-player
+  apiUrl: https://httpbin.org/anything
+  resources:
+  - key: coins
+    initial: 0
+    hasMax: 0
+    max: 0
+  - key: lives
+    initial: 3
+    hasMax: 1
+    max: 3
+  openOnAwake: 1
+  allowUndeclaredResources: 0
+  flushOnApplicationPause: 1
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

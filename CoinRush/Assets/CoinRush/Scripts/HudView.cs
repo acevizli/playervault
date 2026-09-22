@@ -1,19 +1,17 @@
+using PlayerVault;
 using UnityEngine;
 using UnityEngine.UI;
 
 namespace CoinRush
 {
     /// <summary>
-    /// The on-screen readout: coins, lives, and a banner when the run ends.
+    /// The heads-up display: coins, lives, a phase banner, and the state of the reward claim.
     ///
-    /// The whole canvas is built in <c>Awake</c> rather than authored in the scene. Three labels do not
-    /// justify the click-through of a Canvas, a scaler, three rect transforms and their anchors — and
-    /// every one of those is a place to mis-set a value that only shows up on a different aspect ratio.
-    /// Built in code it is the same on every device and it is reviewable in the diff.
-    ///
-    /// It uses the built-in legacy font on purpose: TextMeshPro needs its essential resources imported
-    /// into the project before it will render a single character, and that is a dialog box standing
-    /// between a fresh clone and a running game.
+    /// The whole canvas is built in <see cref="Awake"/> rather than authored in the scene. Four labels
+    /// do not justify hand-placing a Canvas, a scaler and four rect transforms, and each of those is a
+    /// place to mis-set a value that only misbehaves on an aspect ratio nobody tested. It also uses the
+    /// built-in legacy font: TextMeshPro refuses to render a character until its essential resources
+    /// are imported, which puts a dialog box between a fresh clone and a running game.
     /// </summary>
     [RequireComponent(typeof(LevelController))]
     public sealed class HudView : MonoBehaviour
@@ -25,6 +23,7 @@ namespace CoinRush
         Text _coins;
         Text _lives;
         Text _banner;
+        Text _claim;
 
         void Awake()
         {
@@ -37,6 +36,7 @@ namespace CoinRush
             _level.CoinsChanged += OnCoinsChanged;
             _level.LivesChanged += OnLivesChanged;
             _level.PhaseChanged += OnPhaseChanged;
+            _level.ClaimChanged += OnClaimChanged;
         }
 
         void OnDisable()
@@ -44,11 +44,12 @@ namespace CoinRush
             _level.CoinsChanged -= OnCoinsChanged;
             _level.LivesChanged -= OnLivesChanged;
             _level.PhaseChanged -= OnPhaseChanged;
+            _level.ClaimChanged -= OnClaimChanged;
         }
 
-        void OnCoinsChanged(int value) => _coins.text = $"COINS  {value}";
+        void OnCoinsChanged(long value) => _coins.text = $"COINS  {value}";
 
-        void OnLivesChanged(int value) => _lives.text = $"LIVES  {value}";
+        void OnLivesChanged(long value) => _lives.text = $"LIVES  {value}";
 
         void OnPhaseChanged(LevelPhase phase)
         {
@@ -62,21 +63,61 @@ namespace CoinRush
                     break;
                 default:
                     _banner.text = string.Empty;
+                    _claim.text = string.Empty;
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// Renders the claim's own account of itself. Every branch here is a state the case asks the
+        /// SDK to expose, and showing them verbatim is how the integration stays honest — a HUD that
+        /// only knew "granted" would quietly hide the pending and clamped cases.
+        /// </summary>
+        void OnClaimChanged(ClaimRecord record)
+        {
+            if (record == null)
+            {
+                _claim.text = string.Empty;
+                return;
+            }
+
+            switch (record.Status)
+            {
+                case ClaimStatus.Granted:
+                    _claim.text = record.WasClamped
+                        ? $"REWARD +{record.AmountApplied} (capped from {record.AmountRequested})"
+                        : $"REWARD +{record.AmountApplied} COINS";
+                    _claim.color = new Color(1f, 0.85f, 0.25f);
+                    break;
+
+                case ClaimStatus.AlreadyGranted:
+                    _claim.text = "REWARD ALREADY CLAIMED";
+                    _claim.color = new Color(0.7f, 0.75f, 0.8f);
+                    break;
+
+                case ClaimStatus.Pending:
+                    // Pending is not an error. The claim is durable, and the vault replays it on the
+                    // next launch, so the player is told to expect it rather than to retry.
+                    _claim.text = $"REWARD PENDING — WILL RETRY LATER ({record.Attempts} attempts)";
+                    _claim.color = new Color(0.95f, 0.8f, 0.4f);
+                    break;
+
+                case ClaimStatus.Failed:
+                    _claim.text = $"REWARD REFUSED ({record.Failure})";
+                    _claim.color = new Color(1f, 0.45f, 0.4f);
                     break;
             }
         }
 
         void Build()
         {
-            var canvasObject = new GameObject("HUD", typeof(Canvas), typeof(CanvasScaler), typeof(GraphicRaycaster));
+            var canvasObject = new GameObject("HUD",
+                typeof(Canvas), typeof(CanvasScaler), typeof(GraphicRaycaster));
             canvasObject.transform.SetParent(transform, worldPositionStays: false);
 
             var canvas = canvasObject.GetComponent<Canvas>();
             canvas.renderMode = RenderMode.ScreenSpaceOverlay;
 
-            // Scale with the screen rather than sizing in raw pixels, or the text is thumbnail-sized on
-            // a high-density phone. Match 0.5 splits the difference between width and height so the HUD
-            // survives both portrait and a landscape device held sideways.
             var scaler = canvasObject.GetComponent<CanvasScaler>();
             scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
             scaler.referenceResolution = new Vector2(ReferenceWidth, ReferenceHeight);
@@ -94,7 +135,12 @@ namespace CoinRush
                 anchorMin: new Vector2(0f, 0.5f), anchorMax: new Vector2(1f, 0.5f),
                 offsetMin: new Vector2(48f, -200f), offsetMax: new Vector2(-48f, 200f), fontSize: 72);
 
+            _claim = CreateLabel(canvasObject.transform, "Claim", TextAnchor.MiddleCenter,
+                anchorMin: new Vector2(0f, 0.5f), anchorMax: new Vector2(1f, 0.5f),
+                offsetMin: new Vector2(48f, -320f), offsetMax: new Vector2(-48f, -210f), fontSize: 40);
+
             _banner.text = string.Empty;
+            _claim.text = string.Empty;
         }
 
         static Text CreateLabel(Transform parent, string name, TextAnchor alignment,
@@ -118,8 +164,6 @@ namespace CoinRush
             text.horizontalOverflow = HorizontalWrapMode.Overflow;
             text.verticalOverflow = VerticalWrapMode.Overflow;
 
-            // An outline, because white text over a bright amber ball on a dark floor is legible right
-            // up until the ball rolls underneath it.
             var outline = label.GetComponent<Outline>();
             outline.effectColor = new Color(0f, 0f, 0f, 0.75f);
             outline.effectDistance = new Vector2(3f, -3f);
