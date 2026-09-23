@@ -28,6 +28,7 @@ namespace CoinRush
         readonly List<Hazard> _hazards = new List<Hazard>();
 
         Transform _container;
+        HazardMonster.Palette _palette;
 
         /// <summary>The coins in the level as of the last <see cref="Build"/>.</summary>
         public IReadOnlyList<Coin> Coins => _coins;
@@ -113,26 +114,70 @@ namespace CoinRush
 
         Hazard CreateHazard(Transform parent, Vector3 position)
         {
-            var block = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            block.name = "Hazard";
-            block.transform.SetParent(parent, worldPositionStays: false);
-            block.transform.position = position;
-            block.transform.localScale = Vector3.one * hazardSize;
-            Paint(block, hazardMaterial);
+            var root = new GameObject("Hazard");
+            root.transform.SetParent(parent, worldPositionStays: false);
+            root.transform.position = position;
 
             // A trigger instead of a solid collider, so touching a hazard costs a life without also
-            // bouncing the ball away.
-            block.GetComponent<BoxCollider>().isTrigger = true;
+            // bouncing the ball away. A sphere, because the monster turns to face the ball and a box
+            // would change its reach as it turned.
+            var trigger = root.AddComponent<SphereCollider>();
+            trigger.radius = hazardSize * 0.5f;
+            trigger.isTrigger = true;
 
             // A kinematic Rigidbody, because the collider moves every frame. Without one, Unity
             // treats it as static and rebuilds its broadphase every physics step, which is slow.
-            var body = block.AddComponent<Rigidbody>();
+            var body = root.AddComponent<Rigidbody>();
             body.isKinematic = true;
             body.useGravity = false;
 
-            block.AddComponent<HazardMotion>();
+            root.AddComponent<HazardMotion>();
+            root.AddComponent<HazardMonster>().Build(hazardSize, MonsterPalette());
 
-            return block.AddComponent<Hazard>();
+            return root.AddComponent<Hazard>();
+        }
+
+        /// <summary>
+        /// The monster's materials, made once and shared by every hazard. They are copies of the
+        /// hazard material with new colours, which keeps its shader and its emission switched on. A
+        /// material built from scratch in code could use a shader variant the build left out.
+        /// </summary>
+        HazardMonster.Palette MonsterPalette()
+        {
+            if (_palette != null || hazardMaterial == null)
+            {
+                return _palette ?? new HazardMonster.Palette();
+            }
+
+            _palette = new HazardMonster.Palette
+            {
+                Spikes = hazardMaterial,
+                Body = Tint(hazardMaterial, "Monster Body",
+                    new Color(0.18f, 0.02f, 0.06f), new Color(0.25f, 0f, 0.05f)),
+                Eye = Tint(hazardMaterial, "Monster Eye",
+                    new Color(1f, 0.95f, 0.7f), new Color(2.2f, 1.9f, 0.7f)),
+                Pupil = Tint(hazardMaterial, "Monster Pupil",
+                    new Color(0.02f, 0.02f, 0.02f), Color.black),
+            };
+
+            return _palette;
+        }
+
+        static Material Tint(Material source, string name, Color baseColor, Color emission)
+        {
+            var material = new Material(source) { name = name };
+            material.SetColor("_BaseColor", baseColor);
+            material.SetColor("_EmissionColor", emission);
+            return material;
+        }
+
+        void OnDestroy()
+        {
+            // Materials made with `new` are not cleaned up with the scene.
+            if (_palette == null) return;
+            Destroy(_palette.Body);
+            Destroy(_palette.Eye);
+            Destroy(_palette.Pupil);
         }
 
         static void Paint(GameObject target, Material material)

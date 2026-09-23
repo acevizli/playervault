@@ -894,6 +894,7 @@ MonoBehaviour:
   target: {fileID: 869454262}
   offset: {x: 0, y: 12, z: -10}
   smoothTime: 0.12
+  minVisibleWidth: 12
 --- !u!1 &1680951396
 GameObject:
   m_ObjectHideFlags: 0
@@ -1166,6 +1167,7 @@ GameObject:
   - component: {fileID: 1900000004}
   - component: {fileID: 1900000005}
   - component: {fileID: 1900000006}
+  - component: {fileID: 1900000007}
   m_Layer: 0
   m_Name: Game
   m_TagString: Untagged
@@ -1222,6 +1224,8 @@ MonoBehaviour:
   vaultBehaviour: {fileID: 1900000006}
   levels:
   - name: WARM UP
+    rewardId: 
+    unlockKey: 
     coinCount: 8
     coinRingRadius: 9
     hazardCount: 3
@@ -1231,6 +1235,8 @@ MonoBehaviour:
     unlockCost: 0
     firstClearReward: 100
   - name: CROSSFIRE
+    rewardId: 
+    unlockKey: 
     coinCount: 12
     coinRingRadius: 10.5
     hazardCount: 5
@@ -1240,6 +1246,8 @@ MonoBehaviour:
     unlockCost: 150
     firstClearReward: 200
   - name: GAUNTLET
+    rewardId: 
+    unlockKey: 
     coinCount: 14
     coinRingRadius: 11.5
     hazardCount: 7
@@ -1249,6 +1257,8 @@ MonoBehaviour:
     unlockCost: 400
     firstClearReward: 350
   - name: SWARM
+    rewardId: 
+    unlockKey: 
     coinCount: 16
     coinRingRadius: 12
     hazardCount: 10
@@ -1258,6 +1268,8 @@ MonoBehaviour:
     unlockCost: 700
     firstClearReward: 500
   - name: MAELSTROM
+    rewardId: 
+    unlockKey: 
     coinCount: 20
     coinRingRadius: 12.5
     hazardCount: 13
@@ -1331,6 +1343,40 @@ MonoBehaviour:
   flushMode: 0
   debounceIntervalSeconds: 1
   onCorruptData: 0
+--- !u!114 &1900000007
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1900000001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a73f6ef641d34abab7cdc3bb87c9dad5, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::CoinRush.ArenaAtmosphere
+  sceneCamera: {fileID: 0}
+  sun: {fileID: 0}
+  ground: {fileID: 74052457}
+  background: {r: 0.035, g: 0.045, b: 0.08, a: 1}
+  ambientSky: {r: 0.22, g: 0.27, b: 0.42, a: 1}
+  ambientEquator: {r: 0.12, g: 0.12, b: 0.2, a: 1}
+  ambientGround: {r: 0.04, g: 0.04, b: 0.06, a: 1}
+  sunAngles: {x: 55, y: -35, z: 0}
+  sunColor: {r: 1, g: 0.93, b: 0.85, a: 1}
+  sunIntensity: 1.1
+  shadowStrength: 0.7
+  gridCellSize: 2
+  gridGlow: {r: 0.1, g: 0.35, b: 0.6, a: 1}
+  trimMaterial: {fileID: 2100000, guid: e88c3dc053c740f7bb67ae6ebfd34844, type: 2}
+  arenaInnerHalfSize: 14.5
+  wallHeight: 2
+  trimWidth: 0.2
+  bloomThreshold: 0.95
+  bloomIntensity: 0.6
+  bloomScatter: 0.65
+  postExposure: 0.25
+  vignette: 0.3
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
