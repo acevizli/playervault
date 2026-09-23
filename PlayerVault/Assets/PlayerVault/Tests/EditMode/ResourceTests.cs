@@ -130,5 +130,44 @@ namespace PlayerVault.Tests
             Assert.IsTrue(relaxed.GrantLocal("gems", 5).Success);
             Assert.AreEqual(5, relaxed.GetBalance("gems"));
         }
+
+        [Test]
+        public void A_definition_can_be_used_wherever_a_key_is_expected()
+        {
+            var coins = new ResourceDefinition("coins", initial: 100);
+            var config = Config(resources: new[] { coins });
+
+            using var vault = Open(config);
+
+            Assert.IsTrue(vault.Spend(coins, 30).Success);
+            Assert.AreEqual(70, vault.GetBalance(coins));
+            Assert.IsTrue(vault.CanSpend(coins, 70));
+        }
+
+        [Test]
+        public void IsDeclared_reports_only_configured_resources()
+        {
+            using var vault = Open(Config());
+
+            Assert.IsTrue(vault.IsDeclared("coins"));
+            Assert.IsFalse(vault.IsDeclared("coin"));
+            Assert.IsFalse(vault.IsDeclared(null));
+        }
+
+        [Test]
+        public void An_undeclared_resource_is_reported_once_per_key()
+        {
+            var logger = new NullLogger();
+            using var vault = Open(Config(logger: logger));
+
+            vault.Spend("coin", 1);
+            vault.Spend("coin", 1);
+            vault.GrantLocal("coin", 1);
+            vault.Spend("lifes", 1);
+
+            Assert.AreEqual(2, logger.Warnings.Count, "one warning per misspelled key, not per call");
+            StringAssert.Contains("'coin'", logger.Warnings[0]);
+            StringAssert.Contains("coins", logger.Warnings[0], "the warning lists what is declared");
+        }
     }
 }

@@ -29,6 +29,14 @@ namespace PlayerVault
     /// <see cref="CreateConfig"/>, change it and pass it to <see cref="OpenAsync(VaultConfig)"/>.
     /// A vault built entirely in code can be handed over with <see cref="Attach"/>.
     /// </para>
+    /// <para>
+    /// <b>Scenes.</b> Every component that opens a vault for the same player shares one vault,
+    /// so a scene can have its own VaultBehaviour without opening the save a second time. The
+    /// vault is closed, with a final save, when the last of them is destroyed. Turn on
+    /// <c>Persist Across Scenes</c> to keep the component, and the vault, alive through scene
+    /// loads; otherwise a scene change closes the vault and the next scene opens it again, which
+    /// cancels claims that were in flight (they stay pending and are retried).
+    /// </para>
     /// </remarks>
     [AddComponentMenu("PlayerVault/Vault Behaviour")]
     public sealed class VaultBehaviour : MonoBehaviour
@@ -66,6 +74,10 @@ namespace PlayerVault
 
         [Tooltip("Save when the app goes to the background. This is the last callback a mobile game can rely on.")]
         [SerializeField] bool flushOnApplicationPause = true;
+
+        [Tooltip("Keep this GameObject, and the vault, through scene loads. Must be on a root GameObject. " +
+                 "A copy in a scene loaded later shares the vault instead of opening it again.")]
+        [SerializeField] bool persistAcrossScenes;
 
         [Header("Reliability")]
         [Tooltip("Total attempts per session for a claim, including the first.")]
@@ -112,17 +124,46 @@ namespace PlayerVault
         /// </summary>
         readonly object _gate = new object();
 
-        readonly CancellationTokenSource _lifetime = new CancellationTokenSource();
-
         Task<Vault> _opening;
         Vault _pending;
         bool _destroyed;
         bool _ownsVault = true;
 
+        /// <summary>The shared vault this component opened, or null for an attached one.</summary>
+        SharedVault _shared;
+
+        /// <summary>True when this component was kept with DontDestroyOnLoad.</summary>
+        bool _persists;
+
+        /// <summary>
+        /// A vault shared by every component that opened one for the same player. It is closed
+        /// when the last of them is destroyed.
+        /// </summary>
+        sealed class SharedVault
+        {
+            public readonly string PlayerId;
+            public readonly List<VaultBehaviour> Users = new List<VaultBehaviour>();
+            public readonly CancellationTokenSource Lifetime = new CancellationTokenSource();
+            public Task<Vault> Opening;
+
+            /// <summary>Set when the last user leaves. Completes once the vault is closed.</summary>
+            public Task Closed;
+
+            public SharedVault(string playerId) => PlayerId = playerId;
+        }
+
+        static readonly object SharedGate = new object();
+        static readonly Dictionary<string, SharedVault> Shared = new Dictionary<string, SharedVault>(StringComparer.Ordinal);
+
+        static int s_mainThreadId = -1;
+
         /// <summary>The vault, or null until it has finished opening.</summary>
         public Vault Vault { get; private set; }
 
         public bool IsOpen => Vault != null;
+
+        /// <summary>Whether this component survives scene loads.</summary>
+        public bool PersistsAcrossScenes => _persists;
 
         /// <summary>
         /// The error from the last failed open, or null. Set before <see cref="OpenFailed"/> is
@@ -152,6 +193,10 @@ namespace PlayerVault
         }
 
         /// <summary>Raised on the main thread once the vault is open and safe to use.</summary>
+        /// <remarks>
+        /// Raised once. A handler added afterwards never runs; use <see cref="WhenOpen"/> or
+        /// <see cref="WhenOpenAsync"/>, which also cover a vault that is already open.
+        /// </remarks>
         public event Action<Vault> Opened;
 
         /// <summary>
@@ -170,6 +215,10 @@ namespace PlayerVault
 
         async void Awake()
         {
+            s_mainThreadId = Thread.CurrentThread.ManagedThreadId;
+
+            if (persistAcrossScenes) KeepAcrossScenes();
+
             if (!openOnAwake) return;
 
             // Wrapped in try because an unhandled exception from async void crashes, and an open
@@ -201,7 +250,12 @@ namespace PlayerVault
                 if (_opening != null) return _opening;
 
                 OpenError = null;
-                return _opening = OpenCoreAsync(config ?? CreateConfig());
+                var opening = OpenCoreAsync(config ?? CreateConfig());
+
+                // An open that failed synchronously has already cleared _opening, and must stay
+                // cleared so it can be retried.
+                _opening = opening.IsFaulted || opening.IsCanceled ? null : opening;
+                return opening;
             }
         }
 
@@ -210,9 +264,13 @@ namespace PlayerVault
         /// events, the coroutine methods and the background flush for it.
         /// </summary>
         /// <param name="takeOwnership">
-        /// When true (the default), the vault is disposed with the GameObject. Pass false if the
+        /// When true (the default), the vault is closed with the GameObject. Pass false if the
         /// vault should outlive this scene.
         /// </param>
+        /// <remarks>
+        /// An attached vault is not shared with other components; <see cref="OpenAsync()"/> on
+        /// another component for the same player fails, because the save is already in use.
+        /// </remarks>
         public void Attach(Vault vault, bool takeOwnership = true)
         {
             if (vault == null) throw new ArgumentNullException(nameof(vault));
@@ -232,45 +290,195 @@ namespace PlayerVault
                 _pending = vault;
             }
 
-            RunOnMainThread(PublishOpened);
+            PublishOnMainThread(PublishOpened);
         }
 
         async Task<Vault> OpenCoreAsync(VaultConfig config)
         {
+            var shared = await JoinAsync(config).ConfigureAwait(false);
+
+            lock (_gate)
+            {
+                // Destroyed while joining. OnDestroy did not see the shared vault, so leave it here.
+                if (_destroyed)
+                {
+                    _opening = null;
+                    Leave(shared);
+                    throw new ObjectDisposedException(nameof(VaultBehaviour));
+                }
+
+                _shared = shared;
+            }
+
             Vault vault;
 
             try
             {
-                vault = await Vault.OpenAsync(config, _lifetime.Token).ConfigureAwait(false);
+                vault = await shared.Opening.ConfigureAwait(false);
             }
             catch (Exception exception)
             {
-                // Cleared so the open can be retried.
-                lock (_gate) _opening = null;
-                RunOnMainThread(() => PublishFailure(exception));
+                // Cleared so the open can be retried. Every user of a failed open drops it, so
+                // the retry starts a new one.
+                lock (SharedGate)
+                {
+                    shared.Users.Remove(this);
+                    if (Shared.TryGetValue(shared.PlayerId, out var current) && current == shared)
+                        Shared.Remove(shared.PlayerId);
+                }
+
+                lock (_gate)
+                {
+                    _opening = null;
+                    if (_shared == shared) _shared = null;
+                }
+
+                if (!_destroyed) PublishOnMainThread(() => PublishFailure(exception));
                 throw;
             }
 
             lock (_gate)
             {
-                if (_destroyed)
-                {
-                    // The component was destroyed while opening, so nothing else will dispose
-                    // this vault.
-                    vault.Dispose();
-                    throw new ObjectDisposedException(nameof(VaultBehaviour));
-                }
+                // Destroyed while opening. OnDestroy has already left the shared vault, which
+                // closes it if nobody else is using it.
+                if (_destroyed) throw new ObjectDisposedException(nameof(VaultBehaviour));
 
                 vault.BalanceChanged += OnVaultBalanceChanged;
                 vault.ClaimStateChanged += OnVaultClaimStateChanged;
 
-                // Set through the main-thread queue instead of here, so Vault never becomes non-null
-                // on a background thread.
+                // Vault is set on the main thread, never on a background one.
                 _pending = vault;
             }
 
-            RunOnMainThread(PublishOpened);
+            PublishOnMainThread(PublishOpened);
             return vault;
+        }
+
+        /// <summary>
+        /// Joins the vault already open or opening for this player, or starts opening one. Waits
+        /// for a vault that is still closing, such as the previous scene's.
+        /// </summary>
+        async Task<SharedVault> JoinAsync(VaultConfig config)
+        {
+            var playerId = config.PlayerId ?? string.Empty;
+
+            while (true)
+            {
+                Task closing;
+
+                lock (SharedGate)
+                {
+                    if (!Shared.TryGetValue(playerId, out var shared))
+                    {
+                        shared = new SharedVault(playerId);
+                        shared.Opening = Vault.OpenAsync(config, shared.Lifetime.Token);
+                        Shared[playerId] = shared;
+                    }
+
+                    if (shared.Closed == null)
+                    {
+                        shared.Users.Add(this);
+                        return shared;
+                    }
+
+                    closing = shared.Closed;
+                }
+
+                try { await closing.ConfigureAwait(false); }
+                catch (Exception) { /* only the timing matters here */ }
+            }
+        }
+
+        /// <summary>Stops using a shared vault, and closes it if this was the last user.</summary>
+        void Leave(SharedVault shared)
+        {
+            var closed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            lock (SharedGate)
+            {
+                if (!shared.Users.Remove(this) || shared.Users.Count > 0 || shared.Closed != null) return;
+                shared.Closed = closed.Task;
+            }
+
+            _ = CloseSharedAsync(shared, closed);
+        }
+
+        static async Task CloseSharedAsync(SharedVault shared, TaskCompletionSource<bool> closed)
+        {
+            try
+            {
+                // Cancels an open still in progress.
+                try { shared.Lifetime.Cancel(); } catch (Exception) { /* ignore errors during teardown */ }
+
+                Vault vault;
+                try { vault = await shared.Opening.ConfigureAwait(false); }
+                catch (Exception) { return; }   // never opened, so nothing to close
+
+                await vault.CloseAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                Debug.LogException(exception);
+            }
+            finally
+            {
+                lock (SharedGate)
+                {
+                    if (Shared.TryGetValue(shared.PlayerId, out var current) && current == shared)
+                        Shared.Remove(shared.PlayerId);
+                }
+
+                closed.TrySetResult(true);
+            }
+        }
+
+        /// <summary>
+        /// A live component that has, or is opening, a vault for the player. Pass null to accept
+        /// any player, which suits a single-player game. Returns null if there is none.
+        /// </summary>
+        /// <remarks>
+        /// For code in a scene that has no VaultBehaviour of its own, typically when the vault
+        /// lives on a component with <c>Persist Across Scenes</c> in a bootstrap scene. Call it
+        /// from the main thread.
+        /// </remarks>
+        public static VaultBehaviour Find(string playerId = null)
+        {
+            VaultBehaviour match = null;
+
+            foreach (var candidate in FindObjectsByType<VaultBehaviour>(FindObjectsSortMode.None))
+            {
+                if (candidate._destroyed) continue;
+                if (playerId != null && !string.Equals(candidate.PlayerId, playerId, StringComparison.Ordinal)) continue;
+
+                // Prefer one that is already open, then one that will outlive the scene.
+                if (candidate.IsOpen) return candidate;
+                if (match == null || (candidate._persists && !match._persists)) match = candidate;
+            }
+
+            return match;
+        }
+
+        void KeepAcrossScenes()
+        {
+            if (transform.parent != null)
+            {
+                Debug.LogWarning(
+                    $"[PlayerVault] '{name}' has Persist Across Scenes on but is not a root GameObject, " +
+                    "so it is destroyed with its scene. Move it to the root of the hierarchy.", this);
+                return;
+            }
+
+            // Returning to the scene that holds the persistent copy would otherwise add another
+            // persistent copy each time. This one shares the vault and stays with its scene.
+            foreach (var other in FindObjectsByType<VaultBehaviour>(FindObjectsSortMode.None))
+            {
+                if (other != this && other._persists &&
+                    string.Equals(other.PlayerId, playerId, StringComparison.Ordinal))
+                    return;
+            }
+
+            DontDestroyOnLoad(gameObject);
+            _persists = true;
         }
 
         /// <summary>
@@ -345,6 +553,126 @@ namespace PlayerVault
         public void RunOnMainThread(Action action)
         {
             if (action != null) _mainThread.Enqueue(action);
+        }
+
+        static bool OnMainThread => Thread.CurrentThread.ManagedThreadId == s_mainThreadId;
+
+        /// <summary>
+        /// Runs now when already on the main thread, so an open that completes there is visible
+        /// in the same frame. Queues otherwise.
+        /// </summary>
+        void PublishOnMainThread(Action action)
+        {
+            if (OnMainThread) action();
+            else RunOnMainThread(action);
+        }
+
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        static void OnPlayModeStart()
+        {
+            s_mainThreadId = Thread.CurrentThread.ManagedThreadId;
+
+            // With domain reload turned off, statics survive between play sessions.
+            lock (SharedGate) Shared.Clear();
+        }
+
+#if UNITY_EDITOR
+        [UnityEditor.InitializeOnLoadMethod]
+        static void OnEditorLoad() => s_mainThreadId = Thread.CurrentThread.ManagedThreadId;
+#endif
+
+        // ------------------------------------------------------------------ waiting for the open
+
+        /// <summary>
+        /// Runs <paramref name="onOpen"/> with the vault once it is open: immediately if it
+        /// already is, otherwise on the main thread when it opens. It runs once.
+        /// </summary>
+        /// <remarks>
+        /// Replaces checking <see cref="IsOpen"/> and otherwise subscribing to
+        /// <see cref="Opened"/>, which waits forever if the subscription comes after the event.
+        /// <paramref name="onFailed"/> runs for each failed open, including one that failed
+        /// before this call; the hook keeps waiting, so a successful retry still runs
+        /// <paramref name="onOpen"/>.
+        /// </remarks>
+        /// <returns>Dispose it to stop waiting, for example in the caller's OnDestroy.</returns>
+        /// <example>
+        /// <code>
+        /// void Start() => _hook = vaultBehaviour.WhenOpen(OnVaultOpened, OnVaultOpenFailed);
+        /// void OnDestroy() => _hook?.Dispose();
+        /// </code>
+        /// </example>
+        public IDisposable WhenOpen(Action<Vault> onOpen, Action<Exception> onFailed = null)
+        {
+            if (onOpen == null) throw new ArgumentNullException(nameof(onOpen));
+
+            if (IsOpen)
+            {
+                onOpen(Vault);
+                return OpenHook.None;
+            }
+
+            var hook = new OpenHook(this, onOpen, onFailed);
+            if (HasFailedToOpen) onFailed?.Invoke(OpenError);
+            return hook;
+        }
+
+        /// <summary>
+        /// Completes with the vault once it is open and <see cref="Vault"/> is set, so after
+        /// <c>await behaviour.WhenOpenAsync()</c> the vault is always usable. Fails with the
+        /// exception if the open fails, including one that failed before this call.
+        /// </summary>
+        public Task<Vault> WhenOpenAsync()
+        {
+            if (IsOpen) return Task.FromResult(Vault);
+            if (HasFailedToOpen) return Task.FromException<Vault>(OpenError);
+
+            var completion = new TaskCompletionSource<Vault>();
+            IDisposable hook = null;
+
+            hook = WhenOpen(
+                vault => completion.TrySetResult(vault),
+                exception =>
+                {
+                    hook?.Dispose();
+                    completion.TrySetException(exception);
+                });
+
+            return completion.Task;
+        }
+
+        sealed class OpenHook : IDisposable
+        {
+            public static readonly IDisposable None = new OpenHook(null, null, null);
+
+            readonly VaultBehaviour _owner;
+            readonly Action<Vault> _onOpen;
+            readonly Action<Exception> _onFailed;
+
+            public OpenHook(VaultBehaviour owner, Action<Vault> onOpen, Action<Exception> onFailed)
+            {
+                _owner = owner;
+                _onOpen = onOpen;
+                _onFailed = onFailed;
+
+                if (owner == null) return;
+                owner.Opened += HandleOpened;
+                if (onFailed != null) owner.OpenFailed += HandleFailed;
+            }
+
+            void HandleOpened(Vault vault)
+            {
+                Dispose();
+                _onOpen(vault);
+            }
+
+            void HandleFailed(Exception exception) => _onFailed(exception);
+
+            public void Dispose()
+            {
+                if (_owner == null) return;
+                _owner.Opened -= HandleOpened;
+                _owner.OpenFailed -= HandleFailed;
+            }
         }
 
         void Update()
@@ -481,29 +809,84 @@ namespace PlayerVault
             catch (Exception exception) { Debug.LogException(exception); }
         }
 
+        // ------------------------------------------------------------------ test player reset
+
+        /// <summary>
+        /// Deletes the save for this component's player id. Only while the vault is not open,
+        /// because an open vault would write its state straight back: outside play mode, or in
+        /// play mode before opening.
+        /// </summary>
+        [ContextMenu("Delete Save")]
+        void DeleteSaveFromMenu()
+        {
+            if (IsOpen || _opening != null)
+            {
+                Debug.LogError(
+                    $"[PlayerVault] The save for '{PlayerId}' is in use by the open vault. " +
+                    "Exit play mode, then delete it.", this);
+                return;
+            }
+
+            var storage = new JsonFileStorage();
+            var path = storage.PathFor(PlayerId);
+
+            try
+            {
+                Vault.DeleteSaveAsync(PlayerId, storage).GetAwaiter().GetResult();
+                Debug.Log($"[PlayerVault] Deleted the save for '{PlayerId}' ({path}).", this);
+            }
+            catch (Exception exception)
+            {
+                Debug.LogError($"[PlayerVault] Could not delete the save for '{PlayerId}': {exception.Message}", this);
+            }
+        }
+
+#if UNITY_EDITOR
+        [ContextMenu("Show Save File")]
+        void RevealSaveFromMenu()
+        {
+            var storage = new JsonFileStorage();
+            var path = storage.PathFor(PlayerId);
+
+            UnityEditor.EditorUtility.RevealInFinder(System.IO.File.Exists(path) ? path : storage.RootDirectory);
+        }
+#endif
+
         void OnDestroy()
         {
             Vault owned;
-            bool disposes;
+            SharedVault shared;
+            bool closes;
 
             lock (_gate)
             {
                 _destroyed = true;
                 owned = Vault ?? _pending;
+                shared = _shared;
+                _shared = null;
                 _pending = null;
                 Vault = null;
-                disposes = _ownsVault;
+                closes = _ownsVault;
             }
 
-            // Cancels an open still in progress. If it has already created a vault, it sees
-            // _destroyed inside the lock and disposes the vault itself.
-            try { _lifetime.Cancel(); } catch (Exception) { /* ignore errors during teardown */ }
+            if (owned != null)
+            {
+                owned.BalanceChanged -= OnVaultBalanceChanged;
+                owned.ClaimStateChanged -= OnVaultClaimStateChanged;
+            }
 
-            if (owned == null) return;
+            // A shared vault closes when its last user leaves, including one still opening.
+            // An attached vault closes here if the component owns it. Either way it is closed,
+            // not just disposed, so debounced changes are saved, and a vault opened on the same
+            // save meanwhile (the next scene's) waits for that final write.
+            if (shared != null) Leave(shared);
+            else if (owned != null && closes) _ = CloseQuietlyAsync(owned);
+        }
 
-            owned.BalanceChanged -= OnVaultBalanceChanged;
-            owned.ClaimStateChanged -= OnVaultClaimStateChanged;
-            if (disposes) owned.Dispose();
+        static async Task CloseQuietlyAsync(Vault vault)
+        {
+            try { await vault.CloseAsync().ConfigureAwait(false); }
+            catch (Exception exception) { Debug.LogException(exception); }
         }
     }
 }

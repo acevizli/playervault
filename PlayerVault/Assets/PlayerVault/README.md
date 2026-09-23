@@ -8,6 +8,7 @@ runtime assembly references nothing but `UnityEngine`.
 | Folder | |
 | --- | --- |
 | `Runtime/` | The SDK. This is all a game needs. |
+| `Editor/SaveMenu.cs` | **Tools → PlayerVault**: show the save folder, delete every save. Editor only. |
 | `Samples/MinimalExample.cs` | One file: configure, spend, claim, buy, handle every outcome. Drop it on an empty GameObject and press Play. |
 
 ## Thirty seconds
@@ -34,7 +35,10 @@ await vault.TransactAsync(VaultTransaction.Purchase("coins", 250, "level-3-unloc
 
 `VaultBehaviour` is an optional component that does the same from the Inspector, re-raises the
 vault's events on Unity's main thread, offers coroutine forms, and flushes when the app is
-backgrounded.
+backgrounded. Get its vault with `WhenOpen(vault => ...)`, which also covers a vault that is
+already open. Components for the same player share one vault across scenes; tick **Persist
+Across Scenes** to keep it open through scene loads. To reset a test player, use **Delete Save**
+on the component's context menu, or `Vault.DeleteSaveAsync(playerId)` from code.
 
 ## The five things worth knowing
 

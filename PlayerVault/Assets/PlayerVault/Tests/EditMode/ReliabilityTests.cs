@@ -169,7 +169,7 @@ namespace PlayerVault.Tests
 
             Assert.AreEqual(290, vault.GetBalance("coins"), "100 - 60 + 250; neither change may be lost");
 
-            Run(vault.FlushAsync());
+            Run(vault.CloseAsync());
             using var reopened = Open(Config(storage: storage));
             Assert.AreEqual(290, reopened.GetBalance("coins"));
         }
@@ -211,7 +211,7 @@ namespace PlayerVault.Tests
             Assert.AreEqual(160, vault.GetBalance("coins"));
             Assert.AreEqual(3, transport.CallCount);
 
-            Run(vault.FlushAsync());
+            Run(vault.CloseAsync());
             using var reopened = Open(Config(storage: storage));
             Assert.AreEqual(160, reopened.GetBalance("coins"), "every concurrent commit must be on disk");
         }
@@ -273,6 +273,7 @@ namespace PlayerVault.Tests
             Assert.AreEqual(40, vault.GetBalance("coins"));
             Assert.AreEqual(1, vault.GetBalance("level-2-unlocked"));
 
+            Run(vault.CloseAsync());
             using var reopened = Open(Config(storage: storage, resources: new[]
             {
                 new ResourceDefinition("coins", initial: 100),

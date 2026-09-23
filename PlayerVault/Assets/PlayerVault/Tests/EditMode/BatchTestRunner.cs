@@ -1,10 +1,8 @@
 #if UNITY_EDITOR
-using System;
 using System.Text;
-using NUnit.Framework.Api;
-using NUnit.Framework.Interfaces;
-using NUnit.Framework.Internal;
+using System.Threading;
 using UnityEditor;
+using UnityEditor.TestTools.TestRunner.Api;
 using UnityEngine;
 
 namespace PlayerVault.Tests
@@ -15,24 +13,26 @@ namespace PlayerVault.Tests
     /// <remarks>
     /// Development tool, not part of the package. Unity's <c>-runTests</c> switch and the
     /// async <c>TestRunnerApi</c> need the batchmode editor to keep running after the command
-    /// returns, and on some machines they hang. This runs NUnit directly inside one
-    /// <c>-executeMethod</c> call instead. That only works because the tests are plain
-    /// <c>[Test]</c> methods with no coroutines or scenes.
+    /// returns, and on some machines they hang. This asks the Test Framework to run the suite
+    /// synchronously inside one <c>-executeMethod</c> call instead. The tests run on the main
+    /// thread, which the <see cref="VaultBehaviour"/> tests need to create GameObjects.
     /// </remarks>
     public static class BatchTestRunner
     {
-        class Listener : ITestListener
+        class Callbacks : ICallbacks
         {
             public readonly StringBuilder Failures = new StringBuilder();
             public int Passed, Failed, Skipped;
 
-            public void TestStarted(ITest test) { }
+            public void RunStarted(ITestAdaptor testsToRun) { }
+            public void RunFinished(ITestResultAdaptor result) { }
+            public void TestStarted(ITestAdaptor test) { }
 
-            public void TestFinished(ITestResult result)
+            public void TestFinished(ITestResultAdaptor result)
             {
-                if (result.Test.IsSuite) return;
+                if (result.HasChildren) return;
 
-                switch (result.ResultState.Status)
+                switch (result.TestStatus)
                 {
                     case TestStatus.Passed:
                         Passed++;
@@ -52,35 +52,37 @@ namespace PlayerVault.Tests
                 }
             }
 
-            public void TestOutput(TestOutput output) { }
-
             static string Indent(string text) =>
                 string.IsNullOrEmpty(text) ? string.Empty : "      " + text.Replace("\n", "\n      ");
         }
 
         public static void RunEditMode()
         {
-            var exitCode = 1;
+            var callbacks = new Callbacks();
+            var api = ScriptableObject.CreateInstance<TestRunnerApi>();
+            api.RegisterCallbacks(callbacks);
+
+            // The tests block on tasks. With Unity's context installed, a continuation posted
+            // back to this thread would wait for the block to end, which it never does.
+            var context = SynchronizationContext.Current;
+            SynchronizationContext.SetSynchronizationContext(null);
 
             try
             {
-                var runner = new NUnitTestAssemblyRunner(new DefaultTestAssemblyBuilder());
-                runner.Load(typeof(BatchTestRunner).Assembly, new System.Collections.Generic.Dictionary<string, object>());
-
-                var listener = new Listener();
-                runner.Run(listener, TestFilter.Empty);
-
-                Debug.Log($"##TESTS## passed={listener.Passed} failed={listener.Failed} skipped={listener.Skipped}");
-                if (listener.Failed > 0) Debug.Log("##FAILURES##\n" + listener.Failures);
-
-                exitCode = listener.Failed > 0 ? 1 : 0;
+                api.Execute(new ExecutionSettings(new Filter { testMode = TestMode.EditMode })
+                {
+                    runSynchronously = true
+                });
             }
-            catch (Exception exception)
+            finally
             {
-                Debug.Log("##TESTS## runner threw: " + exception);
+                SynchronizationContext.SetSynchronizationContext(context);
             }
 
-            EditorApplication.Exit(exitCode);
+            Debug.Log($"##TESTS## passed={callbacks.Passed} failed={callbacks.Failed} skipped={callbacks.Skipped}");
+            if (callbacks.Failed > 0) Debug.Log("##FAILURES##\n" + callbacks.Failures);
+
+            EditorApplication.Exit(callbacks.Failed > 0 || callbacks.Passed == 0 ? 1 : 0);
         }
     }
 }

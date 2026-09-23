@@ -82,6 +82,16 @@ namespace PlayerVault
         readonly SemaphoreSlim _writeGate = new SemaphoreSlim(1, 1);
         readonly CancellationTokenSource _lifetime = new CancellationTokenSource();
 
+        /// <summary>Identifies this vault's save in <see cref="OpenVaults"/>.</summary>
+        readonly object _saveKey;
+
+        /// <summary>Completes once the vault is disposed and its last write has finished.</summary>
+        readonly TaskCompletionSource<bool> _closed =
+            new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>Resources already reported as undeclared, so each typo is logged once.</summary>
+        readonly HashSet<string> _reportedUndeclared = new HashSet<string>(StringComparer.Ordinal);
+
         bool _loaded;
         Task _loading;
         volatile bool _disposed;
@@ -132,6 +142,7 @@ namespace PlayerVault
             _storage = config.Storage ?? new JsonFileStorage();
             _clock = config.Clock ?? new SystemClock();
             _logger = config.Logger ?? new UnityLogger();
+            _saveKey = OpenVaults.KeyFor(_storage, _playerId);
 
             foreach (var definition in config.Resources)
             {
@@ -184,6 +195,12 @@ namespace PlayerVault
             if (resource != null && _declared.TryGetValue(resource, out var max)) return max;
             return null;
         }
+
+        /// <summary>
+        /// Whether the config declares this resource. Use it to check at startup that the keys a
+        /// game uses in code match the ones configured, for example in the Inspector.
+        /// </summary>
+        public bool IsDeclared(string resource) => resource != null && _declared.ContainsKey(resource);
 
         /// <summary>
         /// A copy of every balance. It is a copy because a claim completing on another thread can
@@ -399,8 +416,23 @@ namespace PlayerVault
         long GetBalanceLocked(string resource) =>
             _balances.TryGetValue(resource, out var balance) ? balance : 0;
 
-        bool IsKnownLocked(string resource) =>
-            _declared.ContainsKey(resource) || _balances.ContainsKey(resource) || _allowUndeclaredResources;
+        bool IsKnownLocked(string resource)
+        {
+            if (_declared.ContainsKey(resource) || _balances.ContainsKey(resource) || _allowUndeclaredResources)
+                return true;
+
+            // Refusing an undeclared resource is how typos are caught, but a refusal the game
+            // does not check is silent. Say so once per key.
+            if (_reportedUndeclared.Add(resource))
+            {
+                _logger.Warn(
+                    $"[PlayerVault] '{resource}' is not a declared resource, so every operation on it " +
+                    $"is refused. Declared: {string.Join(", ", _declared.Keys)}. Check the spelling, or " +
+                    "declare it in VaultConfig.Resources or on the VaultBehaviour.");
+            }
+
+            return false;
+        }
 
         /// <summary>
         /// Rejects empty resource names. Checked separately from whether the resource is
@@ -984,6 +1016,19 @@ namespace PlayerVault
         {
             ThrowIfDisposed();
 
+            // Waits for a vault that is still closing on this save, such as the previous
+            // scene's, and throws if one is open.
+            await OpenVaults.AcquireAsync(_saveKey, this,
+                $"A vault for player '{_playerId}' is already open on this storage. Two vaults on one " +
+                "save overwrite each other's writes: use the open one, or close it before opening another.")
+                .ConfigureAwait(false);
+
+            if (_disposed)
+            {
+                OpenVaults.Release(_saveKey, this);
+                throw new ObjectDisposedException(nameof(Vault));
+            }
+
             string payload;
             try
             {
@@ -1093,16 +1138,77 @@ namespace PlayerVault
         }
 
         /// <summary>
-        /// Flushes, then disposes. Use this for a clean shutdown; <see cref="Dispose"/> alone
-        /// cancels in-flight work and can leave debounced changes unsaved.
+        /// Flushes, disposes, and completes once the last write has finished. Use this for a
+        /// clean shutdown; <see cref="Dispose"/> alone cancels in-flight work and drops debounced
+        /// changes that were not written yet.
         /// </summary>
+        /// <remarks>
+        /// Once this returns, another vault can open the same save and will see everything this
+        /// one wrote. A vault opened on the save earlier waits for this to finish anyway.
+        /// </remarks>
         public async Task CloseAsync()
         {
-            if (_disposed) return;
+            if (!_disposed)
+            {
+                // Mark the save as closing first, so an open that starts during the final flush
+                // waits for it instead of failing because the save is still in use.
+                OpenVaults.BeginRelease(_saveKey, this, _closed.Task);
 
-            try { await PersistAsync().ConfigureAwait(false); }
-            catch (VaultStorageException exception) { _logger.Error("[PlayerVault] Final flush failed.", exception); }
-            finally { Dispose(); }
+                try { await PersistAsync().ConfigureAwait(false); }
+                catch (VaultStorageException exception) { _logger.Error("[PlayerVault] Final flush failed.", exception); }
+                finally { Dispose(); }
+            }
+
+            await _closed.Task.ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Deletes a player's save, including any files quarantined as unreadable. The next open
+        /// for that player starts from the configured starting balances with no claims.
+        /// </summary>
+        /// <remarks>
+        /// Use it for a "reset progress" option or to reset a test player. Refuses while a vault
+        /// is open on the save, because the open vault would write its state straight back:
+        /// close it, delete, then open a new one. Waits for a vault that is still closing.
+        /// </remarks>
+        /// <param name="storage">The storage the vault uses. Defaults to <see cref="JsonFileStorage"/>.</param>
+        /// <exception cref="InvalidOperationException">A vault is open on this save.</exception>
+        /// <exception cref="NotSupportedException">The storage does not implement <see cref="IVaultStorage.DeleteAsync"/>.</exception>
+        /// <exception cref="VaultStorageException">The storage failed to delete the save.</exception>
+        public static async Task DeleteSaveAsync(
+            string playerId, IVaultStorage storage = null, CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(playerId))
+                throw new ArgumentException("A player id is required.", nameof(playerId));
+
+            storage ??= new JsonFileStorage();
+
+            // Hold the save while deleting, so an open that starts meanwhile waits and then
+            // loads nothing, instead of reading a half-deleted save.
+            var key = OpenVaults.KeyFor(storage, playerId);
+            var owner = new object();
+            var deleted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            await OpenVaults.AcquireAsync(key, owner,
+                $"The save for player '{playerId}' cannot be deleted while its vault is open. " +
+                "Close the vault first; it would otherwise write its state straight back.")
+                .ConfigureAwait(false);
+
+            OpenVaults.BeginRelease(key, owner, deleted.Task);
+
+            try
+            {
+                await storage.DeleteAsync(playerId, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (!(exception is NotSupportedException) && !(exception is OperationCanceledException))
+            {
+                throw new VaultStorageException(playerId, $"PlayerVault could not delete the save for '{playerId}'.", exception);
+            }
+            finally
+            {
+                OpenVaults.Release(key, owner);
+                deleted.TrySetResult(true);
+            }
         }
 
         async Task PersistAsync()
@@ -1130,6 +1236,12 @@ namespace PlayerVault
                 // A newer snapshot is already on disk and includes this one's changes, so
                 // writing this one would move the file backwards.
                 if (version <= _writtenVersion) return;
+
+                // Once disposed, the save may already belong to a new vault, which would lose
+                // whatever this write replaced.
+                if (_disposed)
+                    throw new ObjectDisposedException(nameof(Vault),
+                        "The vault was disposed before this change was written. Use CloseAsync to save before closing.");
 
                 await _storage.WriteAsync(_playerId, payload).ConfigureAwait(false);
                 _writtenVersion = version;
@@ -1165,6 +1277,11 @@ namespace PlayerVault
         async Task PersistQuietlyAsync()
         {
             try { await PersistAsync().ConfigureAwait(false); }
+            catch (Exception) when (_disposed)
+            {
+                _logger.Warn("[PlayerVault] A change made just before the vault was disposed was not saved. " +
+                             "Use CloseAsync instead of Dispose to save everything first.");
+            }
             catch (Exception exception) { _logger.Error("[PlayerVault] Background persist failed.", exception); }
         }
 
@@ -1240,16 +1357,42 @@ namespace PlayerVault
         }
 
         /// <summary>
-        /// Cancels in-flight work. Does not flush; call <see cref="FlushAsync"/> first or use
-        /// <see cref="CloseAsync"/> if there may be unsaved changes, which can happen with
-        /// <see cref="FlushMode.Debounced"/>.
+        /// Waits for a write that is still running, then frees the save for another vault. Every
+        /// write after this sees <see cref="_disposed"/> and does not touch the save.
         /// </summary>
+        async Task ReleaseSaveAsync()
+        {
+            try
+            {
+                await _writeGate.WaitAsync().ConfigureAwait(false);
+                _writeGate.Release();
+            }
+            finally
+            {
+                OpenVaults.Release(_saveKey, this);
+                _closed.TrySetResult(true);
+            }
+        }
+
+        /// <summary>
+        /// Cancels in-flight work and stops writing. Does not flush; call <see cref="FlushAsync"/>
+        /// first or use <see cref="CloseAsync"/> if there may be unsaved changes, which can happen
+        /// with <see cref="FlushMode.Debounced"/>.
+        /// </summary>
+        /// <remarks>
+        /// Returns without waiting. A write already running finishes, and a new vault opened on
+        /// the same save waits for it before loading, so it never reads a stale file. Writes that
+        /// had not started are dropped.
+        /// </remarks>
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
 
             try { _lifetime.Cancel(); } catch (Exception) { /* ignore errors during teardown */ }
+
+            OpenVaults.BeginRelease(_saveKey, this, _closed.Task);
+            _ = ReleaseSaveAsync();
 
             // The semaphore and the cancellation source are not disposed. A write or claim may
             // still be finishing on another thread and would throw ObjectDisposedException when

@@ -1,3 +1,4 @@
+using System;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -30,5 +31,17 @@ namespace PlayerVault
         /// recovered. Called when parsing fails and the policy is Quarantine.
         /// </summary>
         Task QuarantineAsync(string key, CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Removes the stored payload and anything quarantined for the key. Deleting a key that
+        /// has nothing stored is not an error. Used by <see cref="Vault.DeleteSaveAsync"/>.
+        /// </summary>
+        /// <remarks>
+        /// Optional: the default throws <see cref="NotSupportedException"/>, so a storage written
+        /// before this method existed still compiles and only resets are unavailable.
+        /// </remarks>
+        Task DeleteAsync(string key, CancellationToken cancellationToken = default) =>
+            Task.FromException(new NotSupportedException(
+                $"{GetType().Name} does not support deleting a save. Implement IVaultStorage.DeleteAsync."));
     }
 }

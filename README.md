@@ -55,6 +55,17 @@ A resource is a key, a starting balance and an optional ceiling. Declaring them 
 
 `PlayerId` identifies the player **and** keys the save, so changing it switches ledger. It is snapshotted when the vault is constructed: editing the config afterwards does not move an open vault to a different player. To switch player, dispose the vault and open another.
 
+Keys are strings everywhere, but a `ResourceDefinition` converts to its key, so a resource declared once in code can be passed to every call instead of repeating the string:
+
+```csharp
+static readonly ResourceDefinition Coins = new ResourceDefinition("coins", initial: 100);
+
+config.Resources.Add(Coins);
+vault.Spend(Coins, 30);
+```
+
+A key that is not declared is refused, and the first refusal for each key is logged with the list of declared keys, so a typo is loud even when the game ignores the result. `IsDeclared(key)` lets a game check at startup that the keys it uses in code match the ones set in the Inspector — CoinRush does exactly that. ScriptableObject definitions and generated key constants were considered and left out: both add an asset or build step to fix a problem the warning already surfaces on first use.
+
 A resource capped at `1` is how this SDK spells a boolean — CoinRush stores "owns level 3" that way, and the vault refuses the second grant itself.
 
 ### Reading and spending
@@ -130,6 +141,8 @@ The synchronous `Spend`/`GrantLocal` schedule their write and report failures th
 
 **Reading.** "There is no save" and "the save could not be read" are different things. The first starts a new player; the second throws `VaultStorageException` and leaves the open failed, because treating a temporarily unreadable file as a new player invites the first write of the session to overwrite it.
 
+**Deleting a save.** `Vault.DeleteSaveAsync(playerId)` removes the save and any quarantined copies, and the next open starts that player over — a "reset progress" option, or a clean test player. It refuses while a vault is open on the save, because the open vault would write its state straight back: close, delete, reopen. In the editor, **Delete Save** on a `VaultBehaviour`'s context menu does the same for its player id (outside play mode), and **Tools → PlayerVault** can show the save folder or delete every save. A custom `IVaultStorage` implements `DeleteAsync` to support this; it has a default that throws `NotSupportedException`, so older storages still compile.
+
 **Corruption.** A save that parses as nothing recognisable is moved aside with a `.corrupt-<timestamp>` suffix and the player starts fresh (`CorruptDataPolicy.Quarantine`, the default) — a player who cannot launch is worse off than one who lost progress, and the quarantined file keeps support recovery possible. `CorruptDataPolicy.Throw` hands the decision to the game instead. A save written by a newer SDK is always refused rather than truncated.
 
 ### Threading and lifecycle
@@ -138,7 +151,9 @@ Every public member of `Vault` is safe to call from any thread. One lock guards 
 
 **Events are raised on whichever thread finished the work.** For anything downstream of a claim that is a thread-pool thread, and a handler touching a `GameObject` or a UI graphic will throw. Use `VaultBehaviour`, which re-raises them on the main thread. A handler that throws is logged and swallowed: a broken HUD must not be able to prevent a save.
 
-The game owns the vault. `Dispose()` cancels in-flight work but does not flush; `CloseAsync()` flushes and then disposes, which is what you want on logout or scene teardown. Two vaults over one storage file would race each other's writes, so keep one per player id.
+The game owns the vault. `CloseAsync()` flushes, disposes, and completes once the last write is on disk — what you want on logout or scene teardown. `Dispose()` cancels in-flight work and returns at once; a write already running finishes, and anything not yet written is dropped.
+
+**One vault per save.** Two vaults on one save would each write their own snapshot over the other's. Opening a save that already has an open vault throws `InvalidOperationException`. Opening one whose vault is *closing* waits for that vault's last write, then loads — so the next scene opening the save while the previous scene's vault is still writing sees everything it wrote. Two `JsonFileStorage` objects on the same folder count as the same save.
 
 ### VaultBehaviour
 
@@ -158,6 +173,15 @@ await behaviour.OpenAsync(config);
 
 behaviour.Attach(myOwnVault);                 // …or hand over a vault you built yourself
 ```
+
+**Getting the vault.** `WhenOpen` runs a callback with the vault — immediately if it is already open, otherwise when it opens — so a consumer's `Start` never has to check `IsOpen` and fall back to `Opened`, which never fires for a late subscriber. `await behaviour.WhenOpenAsync()` is the awaitable form. When the open finishes on the main thread, `Vault` is set in the same frame; only background completions wait for the next `Update`.
+
+```csharp
+void Start()     => _hook = vaultBehaviour.WhenOpen(OnVaultOpened, OnVaultOpenFailed);
+void OnDestroy() => _hook?.Dispose();
+```
+
+**Scenes.** Every component that opens a vault for the same player shares one vault, so each scene can carry its own `VaultBehaviour` without opening the save twice; the first one's settings win, and the vault is closed, with a final save, when the last of them is destroyed. Without anything else, a scene change therefore closes the vault and the next scene opens it again — safe, but claims in flight are cancelled (they stay pending and are retried). Tick **Persist Across Scenes** on a root object to keep the component and its vault alive through scene loads instead; returning to its scene does not create a second persistent copy. Code in a scene with no component of its own finds one with `VaultBehaviour.Find()`.
 
 Opening can fail. `OpenFailed` is raised on the main thread, `OpenError` holds the exception, the failure is retryable by calling `OpenAsync()` again, and the coroutines refuse to run rather than dereferencing a vault that never opened. A component destroyed mid-open disposes the vault that finishes opening afterwards instead of orphaning it.
 
@@ -192,14 +216,16 @@ Unity -batchmode -nographics -projectPath PlayerVault \
       -executeMethod PlayerVault.Tests.BatchTestRunner.RunEditMode
 ```
 
-That entry point drives NUnit synchronously and exits with the suite's status. Unity's own
-`-runTests` switch needs the batchmode editor to keep ticking after the command returns, and on
-some machines — including the one this was developed on — it registers the run and then idles
-indefinitely without executing a single test. Running NUnit inside the one `-executeMethod` call
-sidesteps that; it is possible only because these are plain `[Test]` methods with no coroutines
-and no scene. `BatchTestRunner` is development scaffolding and is not part of the exported package.
+That entry point asks the Test Framework to run the suite synchronously and exits with its
+status. Unity's own `-runTests` switch needs the batchmode editor to keep ticking after the
+command returns, and on some machines — including the one this was developed on — it registers
+the run and then idles indefinitely without executing a single test. Running synchronously
+inside the one `-executeMethod` call sidesteps that; it is possible only because these are plain
+`[Test]` methods with no coroutines. The tests run on the main thread, which the
+`VaultBehaviour` tests need to create GameObjects. `BatchTestRunner` is development scaffolding
+and is not part of the exported package.
 
-**Last run: 72 passed, 0 failed, 0 skipped** (Unity 6000.6.2f1, macOS).
+**Last run: 88 passed, 0 failed, 0 skipped** (Unity 6000.6.2f1, macOS).
 
 **EditMode** (no scene, no network — every dependency is a double):
 
@@ -207,6 +233,7 @@ and no scene. `BatchTestRunner` is development scaffolding and is not part of th
 - `ClaimTests` — grant-once, request shape, joined concurrent claims, clamped claims, rejection versus retry versus offline, non-JSON bodies, malformed input.
 - `PersistenceTests` — restart survival, the guard outliving a session, write-ahead ordering, unreadable and newer-schema saves, storage failure at every boundary, player identity isolation.
 - `ReliabilityTests` — reentrant claims from an event, conflicting retry payloads, a crash at the grant commit, throwing subscribers, disposal mid-write, config mutated after opening, spending while a claim completes on another thread, asynchronously completing dependencies.
+- `LifecycleTests` — one vault per save, a reopen waiting for the previous vault's last write, deleting a save, components sharing a vault, `WhenOpen` before, after and across a failed open.
 - `TransactionTests` — atomic purchases, refusals that move nothing, already-owned items, storage failure, step ordering, clamping.
 
 **PlayMode** (`LiveEndpointTests`) — smoke tests against the real endpoint over `UnityWebRequest`, plus an unreachable-host case. Network-dependent by design; they are the only tests that can fail because of somebody else's outage.
@@ -215,5 +242,5 @@ and no scene. `BatchTestRunner` is development scaffolding and is not part of th
 
 - **No authentication or server-side validation.** The sample endpoint echoes whatever it is sent, so "the backend accepted it" means "the request completed". A production economy needs signed requests, server-side reward validation and cross-device reconciliation, all of which sit behind `IVaultTransport`.
 - **Claim history grows without bound.** Every persistence operation serializes the whole document, and granted records accumulate. Fine at CoinRush's scale; a game with frequent claims and a long history should profile before shipping, and any compaction must preserve the duplicate-prevention information.
-- **One vault per storage key.** Nothing stops a game from constructing two over the same file; they will race each other's writes.
+- **One vault per save, per process.** The guard is in memory, so it does not stop two processes — an editor and a standalone build, say — from sharing a save folder.
 - **Backoff is per session.** There is no persistent retry schedule across launches — unsettled claims replay on the next open, or whenever the game calls `ResumePendingAsync()`.

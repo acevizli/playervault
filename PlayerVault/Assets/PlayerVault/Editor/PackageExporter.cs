@@ -8,8 +8,8 @@ namespace PlayerVault.Editor
     /// Exports the SDK as a .unitypackage for use in a game project.
     /// </summary>
     /// <remarks>
-    /// The package contains Runtime, the readme and the sample. The tests and this script are
-    /// only used to develop the SDK and are left out.
+    /// The package contains Runtime, the save menu, the readme and the sample. The tests and
+    /// this script are only used to develop the SDK and are left out.
     /// </remarks>
     public static class PackageExporter
     {
@@ -17,6 +17,8 @@ namespace PlayerVault.Editor
         {
             "Assets/PlayerVault/Runtime",
             "Assets/PlayerVault/Samples",
+            "Assets/PlayerVault/Editor/PlayerVault.Editor.asmdef",
+            "Assets/PlayerVault/Editor/SaveMenu.cs",
             "Assets/PlayerVault/README.md"
         };
 

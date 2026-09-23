@@ -64,6 +64,9 @@ namespace CoinRush
 
         Vault _vault;
 
+        /// <summary>Waits for the vault to open. Disposed in OnDestroy.</summary>
+        IDisposable _vaultHook;
+
         /// <summary>
         /// The level the player picked. Stored separately so any unlocked level can be replayed.
         /// </summary>
@@ -192,19 +195,10 @@ namespace CoinRush
                 return;
             }
 
-            // Check IsOpen first: VaultBehaviour sets Vault and raises Opened together, so a
-            // listener added afterwards would miss the event. A failed open is also handled, so the
-            // player is told their progress could not be loaded instead of seeing every level locked.
-            vaultBehaviour.OpenFailed += OnVaultOpenFailed;
-
-            if (vaultBehaviour.IsOpen)
-            {
-                OnVaultOpened(vaultBehaviour.Vault);
-            }
-            else
-            {
-                vaultBehaviour.Opened += OnVaultOpened;
-            }
+            // Runs now if the vault is already open, otherwise when it opens. A failed open is
+            // reported too, so the player is told their progress could not be loaded instead of
+            // seeing every level locked.
+            _vaultHook = vaultBehaviour.WhenOpen(OnVaultOpened, OnVaultOpenFailed);
         }
 
         void OnDestroy()
@@ -214,10 +208,10 @@ namespace CoinRush
                 ball.Fell -= OnBallFell;
             }
 
+            _vaultHook?.Dispose();
+
             if (vaultBehaviour != null)
             {
-                vaultBehaviour.Opened -= OnVaultOpened;
-                vaultBehaviour.OpenFailed -= OnVaultOpenFailed;
                 vaultBehaviour.BalanceChanged -= OnBalanceChanged;
                 vaultBehaviour.ClaimStateChanged -= OnClaimStateChanged;
             }
@@ -273,12 +267,16 @@ namespace CoinRush
         /// </summary>
         void WarnIfUnlockResourcesMissing()
         {
-            var balances = _vault.Balances;
+            foreach (var key in new[] { CoinsResource, LivesResource })
+            {
+                if (!_vault.IsDeclared(key))
+                    Debug.LogError($"[CoinRush] The '{key}' resource is not declared on the VaultBehaviour.");
+            }
 
             for (var i = 1; i < levels.Count; i++)
             {
                 var key = UnlockKeyFor(i);
-                if (balances.ContainsKey(key)) continue;
+                if (_vault.IsDeclared(key)) continue;
 
                 Debug.LogWarning(
                     $"[CoinRush] Level {i + 1} ('{levels[i].name}') has no '{key}' resource declared " +

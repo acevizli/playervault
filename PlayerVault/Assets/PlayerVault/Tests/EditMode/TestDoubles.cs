@@ -157,6 +157,12 @@ namespace PlayerVault.Tests
             return Task.CompletedTask;
         }
 
+        public Task DeleteAsync(string key, CancellationToken cancellationToken = default)
+        {
+            lock (_sync) _files.Remove(key);
+            return Task.CompletedTask;
+        }
+
         internal sealed class SimulatedIOException : Exception
         {
             public SimulatedIOException(string message) : base(message) { }
@@ -202,8 +208,19 @@ namespace PlayerVault.Tests
             get { lock (_sync) return new List<string>(_errors); }
         }
 
+        readonly List<string> _warnings = new List<string>();
+
+        public List<string> Warnings
+        {
+            get { lock (_sync) return new List<string>(_warnings); }
+        }
+
         public void Info(string message) { }
-        public void Warn(string message) { }
+
+        public void Warn(string message)
+        {
+            lock (_sync) _warnings.Add(message);
+        }
 
         public void Error(string message, Exception exception = null)
         {

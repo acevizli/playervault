@@ -28,5 +28,21 @@ namespace PlayerVault
             Initial = initial;
             Max = max;
         }
+
+        /// <summary>
+        /// Lets a definition stand in for its key, so a resource declared once in code can be
+        /// passed to every API instead of repeating its key as a string.
+        /// </summary>
+        /// <example>
+        /// <code>
+        /// static readonly ResourceDefinition Coins = new ResourceDefinition("coins", initial: 100);
+        ///
+        /// config.Resources.Add(Coins);
+        /// vault.Spend(Coins, 30);
+        /// </code>
+        /// </example>
+        public static implicit operator string(ResourceDefinition definition) => definition?.Key;
+
+        public override string ToString() => Key;
     }
 }

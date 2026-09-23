@@ -79,6 +79,26 @@ namespace PlayerVault
             return Task.CompletedTask;
         }
 
+        /// <summary>Deletes the save, a leftover temporary file, and every quarantined copy.</summary>
+        public Task DeleteAsync(string key, CancellationToken cancellationToken = default)
+        {
+            var path = PathFor(key);
+
+            if (File.Exists(path)) File.Delete(path);
+            if (File.Exists(path + ".tmp")) File.Delete(path + ".tmp");
+
+            if (Directory.Exists(_root))
+            {
+                foreach (var quarantined in Directory.GetFiles(_root, Path.GetFileName(path) + ".corrupt-*"))
+                    File.Delete(quarantined);
+            }
+
+            return Task.CompletedTask;
+        }
+
+        /// <summary>The folder every save is written to.</summary>
+        public string RootDirectory => _root;
+
         /// <summary>
         /// Turns a key into a file name that is readable and unique.
         /// </summary>
