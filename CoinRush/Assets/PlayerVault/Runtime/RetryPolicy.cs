@@ -3,7 +3,7 @@ using System;
 namespace PlayerVault
 {
     /// <summary>
-    /// How hard the SDK tries before leaving a claim for the next launch.
+    /// How many times, and how often, a claim is retried before it is left for the next launch.
     /// </summary>
     public sealed class RetryPolicy
     {
@@ -17,8 +17,8 @@ namespace PlayerVault
         public TimeSpan MaxDelay { get; set; } = TimeSpan.FromSeconds(10);
 
         /// <summary>
-        /// Random spread applied to each delay, as a fraction. 0.25 means ±25%.
-        /// Stops a crowd of clients retrying in lockstep after an outage.
+        /// Random variation applied to each delay, as a fraction. 0.25 means +/-25%. This
+        /// stops many clients from retrying at the same moment after an outage.
         /// </summary>
         public double Jitter { get; set; } = 0.25;
 
@@ -26,12 +26,24 @@ namespace PlayerVault
         /// Per-attempt request timeout.
         /// </summary>
         /// <remarks>
-        /// Deliberately generous. Measured latency against the sample endpoint ranged from
-        /// 0.6s to 6.0s, and every timeout produces an <i>indeterminate</i> outcome rather
-        /// than a clean failure — so an aggressive timeout manufactures exactly the ambiguity
-        /// the SDK works hardest to avoid.
+        /// Set high on purpose. Measured latency against the sample endpoint was 0.6s to 6.0s.
+        /// A timed-out request has an unknown outcome, so a short timeout creates more claims
+        /// whose result is unknown.
         /// </remarks>
         public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(15);
+
+        /// <summary>
+        /// A copy. The vault takes one at construction, so later edits to the game's policy
+        /// do not affect requests already in flight.
+        /// </summary>
+        internal RetryPolicy Clone() => new RetryPolicy
+        {
+            MaxAttempts = MaxAttempts,
+            BaseDelay = BaseDelay,
+            MaxDelay = MaxDelay,
+            Jitter = Jitter,
+            Timeout = Timeout
+        };
 
         internal TimeSpan DelayForAttempt(int attempt, Random random)
         {

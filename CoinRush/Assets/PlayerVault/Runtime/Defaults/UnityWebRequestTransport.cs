@@ -9,20 +9,18 @@ namespace PlayerVault
     /// The default transport, over <see cref="UnityWebRequest"/>.
     /// </summary>
     /// <remarks>
-    /// Callable from any thread. That matters more than it sounds: the SDK awaits its
-    /// retry backoff, and an awaited continuation resumes on the thread pool, so the
-    /// second attempt of any claim arrives here off Unity's main thread. Every
-    /// UnityWebRequest member — including construction — throws there, so this class
-    /// captures Unity's synchronization context when it is built and marshals onto it.
+    /// Can be called from any thread. The SDK awaits its retry delay, which resumes on the
+    /// thread pool, so retries reach this class off Unity's main thread. UnityWebRequest
+    /// throws when used off the main thread, so this class captures Unity's
+    /// synchronization context when it is created and runs requests on it.
     /// </remarks>
     public sealed class UnityWebRequestTransport : IVaultTransport
     {
         readonly TimeSpan _timeout;
 
         /// <summary>
-        /// Unity's context, captured at construction. Null when constructed off the main
-        /// thread, in which case calls run inline and Unity will complain — which is the
-        /// correct, loud failure rather than a silent one.
+        /// Unity's context, captured at construction. Null if constructed off the main thread;
+        /// calls then run inline and Unity throws, which makes the mistake visible.
         /// </summary>
         readonly SynchronizationContext _unityContext;
 
@@ -44,11 +42,9 @@ namespace PlayerVault
 
                 try
                 {
-                    // The three-argument overload. The two-argument UnityWebRequest.Post(url, string)
-                    // is obsolete and hidden from IntelliSense in Unity 6, and routes to PostWwwForm:
-                    // it percent-encodes the entire JSON document into a form field *key* and sends
-                    // application/x-www-form-urlencoded. Servers still answer 200, so the mistake
-                    // looks like success while transmitting nothing usable.
+                    // Use the three-argument overload. The two-argument Post(url, string) is
+                    // obsolete in Unity 6 and sends the JSON as a URL-encoded form field. Servers
+                    // still return 200, so the bug is easy to miss.
                     request = UnityWebRequest.Post(url, jsonBody, "application/json");
                     request.timeout = Math.Max(1, (int)Math.Ceiling(_timeout.TotalSeconds));
 
@@ -60,8 +56,8 @@ namespace PlayerVault
 
                     var operation = request.SendWebRequest();
 
-                    // Read and dispose here: this callback is the last point guaranteed to be
-                    // on the main thread, and the awaiting caller resumes on the thread pool.
+                    // Read the response and dispose here. This callback runs on the main thread;
+                    // the awaiting caller resumes on the thread pool.
                     operation.completed += _ =>
                     {
                         try { completion.TrySetResult(Classify(pending)); }
@@ -101,15 +97,15 @@ namespace PlayerVault
                     return TransportResponse.Success(status, body);
 
                 case UnityWebRequest.Result.ProtocolError:
-                    // 429 is a throttle, not a refusal, so it retries with the 5xx family.
+                    // 429 means throttled, so it is retried like a 5xx.
                     if (status == 429 || status >= 500)
                         return TransportResponse.Retryable(status, body, request.error);
                     return TransportResponse.Rejected(status, body, request.error);
 
                 case UnityWebRequest.Result.ConnectionError:
-                    // No connection, DNS failure, TLS failure, timeout and Abort all collapse
-                    // into this one value with responseCode -1; Unity does not expose which.
-                    // It means no response was processed — NOT that the server did nothing.
+                    // No connection, DNS failure, TLS failure, timeout and abort all end up here
+                    // with responseCode -1, and Unity does not say which. It means no response
+                    // arrived. The server may still have processed the request.
                     return TransportResponse.Indeterminate(request.error);
 
                 default:

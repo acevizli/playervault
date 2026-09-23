@@ -15,11 +15,9 @@ namespace PlayerVault.Tests
         /// Runs a task to completion synchronously.
         /// </summary>
         /// <remarks>
-        /// Safe here, and deliberate: every test double completes synchronously
-        /// (Task.FromResult / Task.CompletedTask) and the SDK uses ConfigureAwait(false)
-        /// throughout, so nothing is waiting on a captured context. Blocking keeps the tests
-        /// plain [Test] methods with ordinary asserts, rather than coroutine-shaped
-        /// [UnityTest] methods where a failed assert is harder to read.
+        /// Safe here because the test doubles complete synchronously and the SDK uses
+        /// ConfigureAwait(false), so nothing waits on a captured context. Blocking lets the
+        /// tests be plain [Test] methods instead of [UnityTest] coroutines.
         /// </remarks>
         public static T Run<T>(Task<T> task) => task.GetAwaiter().GetResult();
 
@@ -31,11 +29,12 @@ namespace PlayerVault.Tests
             IVaultClock clock = null,
             IVaultLogger logger = null,
             IEnumerable<ResourceDefinition> resources = null,
-            int maxAttempts = 3)
+            int maxAttempts = 3,
+            string playerId = Player)
         {
             var config = new VaultConfig
             {
-                PlayerId = Player,
+                PlayerId = playerId,
                 ApiUrl = "https://example.test/claim",
                 Transport = transport ?? FakeTransport.Ok(),
                 Storage = storage ?? new InMemoryStorage(),

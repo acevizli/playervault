@@ -9,14 +9,12 @@ using UnityEngine.TestTools;
 namespace PlayerVault.Tests
 {
     /// <summary>
-    /// The only tests that touch the network. They exist because
-    /// <see cref="UnityWebRequestTransport"/> is the one component the EditMode suite
-    /// cannot exercise — everything else runs against a fake.
+    /// The only tests that use the network. They cover
+    /// <see cref="UnityWebRequestTransport"/>, which the EditMode tests replace with a fake.
     /// </summary>
     /// <remarks>
-    /// Tagged <c>Network</c> so they can be excluded. The sample endpoint returns a
-    /// transient 502 occasionally, so a failure here is worth re-running once before
-    /// believing it.
+    /// Tagged <c>Network</c> so they can be excluded. The sample endpoint sometimes returns
+    /// a 502, so re-run a failure once before trusting it.
     /// </remarks>
     [TestFixture]
     [Category("Network")]

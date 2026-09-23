@@ -5,8 +5,8 @@ using static PlayerVault.Tests.VaultTestHarness;
 namespace PlayerVault.Tests
 {
     /// <summary>
-    /// A restart is modelled by disposing the vault and opening a new one over the same
-    /// storage — which is exactly what a relaunch does with the real file.
+    /// A restart is simulated by disposing the vault and opening a new one on the same
+    /// storage, which is what a relaunch does with the real file.
     /// </summary>
     [TestFixture]
     internal sealed class PersistenceTests
@@ -110,7 +110,7 @@ namespace PlayerVault.Tests
         public void Unreadable_state_is_quarantined_and_the_player_starts_fresh()
         {
             var storage = new InMemoryStorage();
-            storage.Files[Player] = "this is not json";
+            storage.Seed(Player, "this is not json");
 
             using var vault = Open(Config(storage: storage));
 
@@ -122,7 +122,7 @@ namespace PlayerVault.Tests
         public void Unreadable_state_throws_when_the_game_asks_it_to()
         {
             var storage = new InMemoryStorage();
-            storage.Files[Player] = "this is not json";
+            storage.Seed(Player, "this is not json");
 
             var config = Config(storage: storage);
             config.OnCorruptData = CorruptDataPolicy.Throw;
@@ -134,8 +134,8 @@ namespace PlayerVault.Tests
         public void State_from_a_newer_SDK_is_refused_rather_than_truncated()
         {
             var storage = new InMemoryStorage();
-            storage.Files[Player] =
-                "{\"schemaVersion\":99,\"playerId\":\"test-player\",\"balances\":[],\"claims\":[]}";
+            storage.Seed(Player,
+                "{\"schemaVersion\":99,\"playerId\":\"test-player\",\"balances\":[],\"claims\":[]}");
 
             var exception = Assert.Throws<InvalidOperationException>(() => Open(Config(storage: storage)));
             StringAssert.Contains("newer SDK", exception.Message);
@@ -162,14 +162,14 @@ namespace PlayerVault.Tests
         [Test]
         public void A_pending_record_is_written_before_the_request_goes_out()
         {
-            // The write-ahead guarantee. If the process died during the request, the claim
-            // has to already be on disk or there is no evidence it was ever attempted.
+            // If the process dies during the request, the claim must already be on disk so it
+            // can be retried.
             var storage = new InMemoryStorage();
             string persistedDuringRequest = null;
 
             var transport = new FakeTransport(_ =>
             {
-                storage.Files.TryGetValue(Player, out persistedDuringRequest);
+                persistedDuringRequest = storage.Read(Player);
                 return TransportResponse.Success(200, "{\"json\":{}}");
             });
 
@@ -182,22 +182,117 @@ namespace PlayerVault.Tests
         }
 
         [Test]
-        public void A_failed_write_leaves_disk_behind_memory_rather_than_ahead_of_it()
+        public void A_claim_that_cannot_be_saved_is_not_reported_as_granted()
         {
-            // Failing safe: the next launch reads disk, so a reward may be re-requested.
-            // The opposite ordering would mark it granted on disk and lose it forever.
+            // A failed write must not be reported as Granted, or the game would give out a
+            // reward that is lost on restart.
             var storage = new InMemoryStorage();
             var logger = new NullLogger();
-            var config = Config(storage: storage, logger: logger);
 
-            using var vault = Open(config);
+            using var vault = Open(Config(storage: storage, logger: logger));
             storage.FailWrites = true;
 
             var result = Run(vault.ClaimAsync("level-10", "coins", 250));
 
-            Assert.AreEqual(ClaimStatus.Granted, result.Status);
-            Assert.IsFalse(storage.Files.ContainsKey(Player), "nothing should have reached disk");
+            Assert.AreEqual(ClaimStatus.Pending, result.Status, "a claim that did not reach disk is not granted");
+            Assert.AreEqual(ClaimFailure.Storage, result.Failure);
+            Assert.IsFalse(storage.Has(Player), "nothing should have reached disk");
+            Assert.AreEqual(100, vault.GetBalance("coins"), "the balance must not move without the write that records it");
             Assert.IsNotEmpty(logger.Errors, "a persist failure must be reported, not swallowed");
+        }
+
+        [Test]
+        public void A_claim_whose_write_ahead_record_fails_never_reaches_the_network()
+        {
+            // Without the pending record on disk, a crash would lose the claim, so the request
+            // must not be sent.
+            var storage = new InMemoryStorage { FailWrites = true };
+            var transport = FakeTransport.Ok();
+
+            using var vault = Open(Config(transport, storage));
+
+            var result = Run(vault.ClaimAsync("level-10", "coins", 250));
+
+            Assert.AreEqual(ClaimStatus.Pending, result.Status);
+            Assert.AreEqual(ClaimFailure.Storage, result.Failure);
+            Assert.AreEqual(0, transport.CallCount, "the request must wait for the write-ahead record");
+        }
+
+        [Test]
+        public void A_spend_that_cannot_be_saved_is_refused_and_rolled_back()
+        {
+            var storage = new InMemoryStorage();
+            using var vault = Open(Config(storage: storage));
+
+            storage.FailWrites = true;
+            var result = Run(vault.SpendAsync("coins", 30));
+
+            Assert.IsFalse(result.Success, "SpendAsync promises durability; it must not report success without it");
+            Assert.AreEqual(SpendFailure.StorageUnavailable, result.Failure);
+            Assert.AreEqual(100, vault.GetBalance("coins"), "the deduction must be rolled back, not left in memory");
+        }
+
+        [Test]
+        public void Flushing_reports_a_write_failure_to_the_caller()
+        {
+            var storage = new InMemoryStorage();
+            using var vault = Open(Config(storage: storage));
+
+            vault.Spend("coins", 10);
+            storage.FailWrites = true;
+
+            Assert.Throws<VaultStorageException>(() => Run(vault.FlushAsync()));
+        }
+
+        [Test]
+        public void An_unreadable_save_fails_the_open_rather_than_starting_a_new_player()
+        {
+            // A read error is not the same as no save. Starting fresh would let the first write
+            // overwrite a save that was only temporarily unreadable.
+            var storage = new InMemoryStorage();
+            storage.Seed(Player, "{\"schemaVersion\":1,\"playerId\":\"test-player\",\"balances\":[],\"claims\":[]}");
+            storage.FailReads = true;
+
+            var exception = Assert.Throws<VaultStorageException>(() => Open(Config(storage: storage)));
+
+            Assert.AreEqual(Player, exception.PlayerId);
+            Assert.IsTrue(storage.Has(Player), "the existing save must be left alone");
+        }
+
+        [Test]
+        public void Two_players_do_not_share_a_save_file()
+        {
+            var storage = new InMemoryStorage();
+
+            using (var first = Open(Config(storage: storage, playerId: "a/b")))
+            {
+                first.Spend("coins", 40);
+                Run(first.FlushAsync());
+            }
+
+            using var second = Open(Config(storage: storage, playerId: "a_b"));
+
+            Assert.AreEqual(100, second.GetBalance("coins"), "one player's spend must not show up in another's ledger");
+        }
+
+        [Test]
+        public void A_save_belonging_to_a_different_player_is_refused()
+        {
+            // Backup check behind the file name: the document records which player it belongs to.
+            var storage = new InMemoryStorage();
+            storage.Seed(Player, "{\"schemaVersion\":1,\"playerId\":\"somebody-else\",\"balances\":[],\"claims\":[]}");
+
+            var exception = Assert.Throws<InvalidOperationException>(() => Open(Config(storage: storage)));
+            StringAssert.Contains("somebody-else", exception.Message);
+        }
+
+        [Test]
+        public void Distinct_player_ids_map_to_distinct_file_names()
+        {
+            Assert.AreNotEqual(JsonFileStorage.FileNameFor("a/b"), JsonFileStorage.FileNameFor("a_b"));
+            Assert.AreNotEqual(JsonFileStorage.FileNameFor("player@one.com"), JsonFileStorage.FileNameFor("player_one_com"));
+            Assert.AreEqual(JsonFileStorage.FileNameFor("steady"), JsonFileStorage.FileNameFor("steady"),
+                "the same id must always map to the same file");
         }
     }
 

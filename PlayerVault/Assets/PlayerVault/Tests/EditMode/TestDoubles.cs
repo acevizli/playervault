@@ -6,19 +6,38 @@ using System.Threading.Tasks;
 namespace PlayerVault.Tests
 {
     /// <summary>
-    /// A transport that never touches the network. Records every body it was handed so a
-    /// test can assert on the wire format, and counts calls so a test can prove a request
-    /// was NOT sent — which is how idempotency is actually verified.
+    /// A transport that never uses the network. Records every request body so tests can
+    /// check the format, and counts calls so tests can check that no request was sent.
     /// </summary>
     internal sealed class FakeTransport : IVaultTransport
     {
         readonly Func<int, TransportResponse> _responder;
+        readonly object _sync = new object();
 
-        public readonly List<string> Bodies = new List<string>();
-        public int CallCount => Bodies.Count;
+        readonly List<string> _bodies = new List<string>();
 
-        /// <summary>Optional gate, so a test can hold requests open and exercise concurrency.</summary>
+        /// <summary>A copy, because a test may read this while a claim is still running.</summary>
+        public List<string> Bodies
+        {
+            get { lock (_sync) return new List<string>(_bodies); }
+        }
+
+        public int CallCount
+        {
+            get { lock (_sync) return _bodies.Count; }
+        }
+
+        /// <summary>Optional gate that lets a test hold requests open to test concurrency.</summary>
         public Task Gate;
+
+        /// <summary>
+        /// Resumes on the thread pool even when nothing would otherwise suspend, to behave like
+        /// real I/O.
+        /// </summary>
+        public bool CompleteAsynchronously;
+
+        /// <summary>Raised on every call, before the response is created. Used by reentrancy tests.</summary>
+        public Action<int> OnRequest;
 
         public FakeTransport(Func<int, TransportResponse> responder) => _responder = responder;
 
@@ -34,64 +53,140 @@ namespace PlayerVault.Tests
 
         public async Task<TransportResponse> PostAsync(string url, string jsonBody, CancellationToken cancellationToken)
         {
-            Bodies.Add(jsonBody);
+            int attempt;
+            lock (_sync)
+            {
+                _bodies.Add(jsonBody);
+                attempt = _bodies.Count;
+            }
+
+            OnRequest?.Invoke(attempt);
+
+            if (CompleteAsynchronously) await Task.Yield();
             if (Gate != null) await Gate.ConfigureAwait(false);
+
             cancellationToken.ThrowIfCancellationRequested();
-            return _responder(Bodies.Count);
+            return _responder(attempt);
         }
     }
 
     /// <summary>
-    /// Storage in a dictionary. Surviving a restart is modelled by constructing a second
-    /// Vault over the same instance — which is exactly what the real thing does with a file.
+    /// Storage in a dictionary. A restart is simulated by creating a second Vault on the same
+    /// instance.
     /// </summary>
     internal sealed class InMemoryStorage : IVaultStorage
     {
-        public readonly Dictionary<string, string> Files = new Dictionary<string, string>();
+        readonly object _sync = new object();
+        readonly Dictionary<string, string> _files = new Dictionary<string, string>(StringComparer.Ordinal);
+
         public readonly List<string> Quarantined = new List<string>();
 
         public int Writes;
+
+        /// <summary>Every write throws while this is set.</summary>
         public bool FailWrites;
 
-        public Task<string> ReadAsync(string key, CancellationToken cancellationToken = default) =>
-            Task.FromResult(Files.TryGetValue(key, out var payload) ? payload : null);
+        /// <summary>Every read throws while this is set, like a locked or damaged file.</summary>
+        public bool FailReads;
 
-        public Task WriteAsync(string key, string payload, CancellationToken cancellationToken = default)
+        /// <summary>
+        /// Completes reads and writes on the thread pool instead of inline, to check that the
+        /// SDK's ordering holds when work resumes on another thread.
+        /// </summary>
+        public bool CompleteAsynchronously;
+
+        /// <summary>Raised inside a write, before it completes. Used by interleaving tests.</summary>
+        public Action<string> OnWrite;
+
+        public Dictionary<string, string> Files
         {
-            if (FailWrites) throw new IOException_Simulated();
+            get { lock (_sync) return new Dictionary<string, string>(_files, StringComparer.Ordinal); }
+        }
 
-            Writes++;
-            Files[key] = payload;
-            return Task.CompletedTask;
+        public bool Has(string key)
+        {
+            lock (_sync) return _files.ContainsKey(key);
+        }
+
+        public string Read(string key)
+        {
+            lock (_sync) return _files.TryGetValue(key, out var payload) ? payload : null;
+        }
+
+        public void Seed(string key, string payload)
+        {
+            lock (_sync) _files[key] = payload;
+        }
+
+        public async Task<string> ReadAsync(string key, CancellationToken cancellationToken = default)
+        {
+            if (CompleteAsynchronously) await Task.Yield();
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (FailReads) throw new SimulatedIOException("the save file could not be read");
+
+            lock (_sync) return _files.TryGetValue(key, out var payload) ? payload : null;
+        }
+
+        public async Task WriteAsync(string key, string payload, CancellationToken cancellationToken = default)
+        {
+            if (CompleteAsynchronously) await Task.Yield();
+
+            OnWrite?.Invoke(payload);
+
+            if (FailWrites) throw new SimulatedIOException("the save file could not be written");
+
+            lock (_sync)
+            {
+                Writes++;
+                _files[key] = payload;
+            }
         }
 
         public Task QuarantineAsync(string key, CancellationToken cancellationToken = default)
         {
-            if (Files.TryGetValue(key, out var payload))
+            lock (_sync)
             {
-                Quarantined.Add(payload);
-                Files.Remove(key);
+                if (_files.TryGetValue(key, out var payload))
+                {
+                    Quarantined.Add(payload);
+                    _files.Remove(key);
+                }
             }
 
             return Task.CompletedTask;
         }
 
-        internal sealed class IOException_Simulated : Exception { }
+        internal sealed class SimulatedIOException : Exception
+        {
+            public SimulatedIOException(string message) : base(message) { }
+        }
     }
 
     /// <summary>
-    /// Time that never actually passes, so retry backoff is exercised without waiting for it.
+    /// A clock that does not wait, so retry delays cost no time in tests.
     /// </summary>
     internal sealed class FakeClock : IVaultClock
     {
-        public DateTimeOffset UtcNow { get; set; } = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        readonly object _sync = new object();
+        DateTimeOffset _now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+        public DateTimeOffset UtcNow
+        {
+            get { lock (_sync) return _now; }
+            set { lock (_sync) _now = value; }
+        }
 
         public readonly List<TimeSpan> Delays = new List<TimeSpan>();
 
         public Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken = default)
         {
-            Delays.Add(delay);
-            UtcNow = UtcNow.Add(delay);
+            lock (_sync)
+            {
+                Delays.Add(delay);
+                _now = _now.Add(delay);
+            }
+
             cancellationToken.ThrowIfCancellationRequested();
             return Task.CompletedTask;
         }
@@ -99,10 +194,20 @@ namespace PlayerVault.Tests
 
     internal sealed class NullLogger : IVaultLogger
     {
-        public readonly List<string> Errors = new List<string>();
+        readonly object _sync = new object();
+        readonly List<string> _errors = new List<string>();
+
+        public List<string> Errors
+        {
+            get { lock (_sync) return new List<string>(_errors); }
+        }
 
         public void Info(string message) { }
         public void Warn(string message) { }
-        public void Error(string message, Exception exception = null) => Errors.Add(message);
+
+        public void Error(string message, Exception exception = null)
+        {
+            lock (_sync) _errors.Add(message);
+        }
     }
 }

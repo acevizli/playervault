@@ -15,8 +15,8 @@ namespace PlayerVault.Internal
         public static string Serialize(VaultDocument document) => JsonUtility.ToJson(document, true);
 
         /// <summary>
-        /// Parses a stored document. Returns false rather than throwing, so the caller can
-        /// apply the configured corruption policy.
+        /// Parses a saved document. Returns false instead of throwing, so the caller can apply
+        /// the corrupt-data policy.
         /// </summary>
         public static bool TryDeserialize(string payload, out VaultDocument document, out string error)
         {
@@ -45,9 +45,8 @@ namespace PlayerVault.Internal
                 return false;
             }
 
-            // JsonUtility happily returns a default-constructed object for JSON that
-            // contains none of the expected fields, so absence of a player id is the
-            // signal that this was not one of our documents.
+            // JsonUtility returns an empty object for JSON with none of the expected fields,
+            // so a missing player id means this is not a vault document.
             if (string.IsNullOrEmpty(document.playerId))
             {
                 error = "document has no playerId";
@@ -69,7 +68,9 @@ namespace PlayerVault.Internal
             failure = record.Failure.ToString(),
             attempts = record.Attempts,
             createdAt = record.CreatedAt.ToString(TimestampFormat, CultureInfo.InvariantCulture),
-            updatedAt = record.UpdatedAt.ToString(TimestampFormat, CultureInfo.InvariantCulture)
+            updatedAt = record.UpdatedAt.ToString(TimestampFormat, CultureInfo.InvariantCulture),
+            lastStatusCode = record.LastStatusCode,
+            lastError = record.LastError
         };
 
         public static ClaimRecord ToRecord(ClaimEntry entry)
@@ -89,7 +90,9 @@ namespace PlayerVault.Internal
                 failure,
                 entry.attempts,
                 ParseTimestamp(entry.createdAt),
-                ParseTimestamp(entry.updatedAt));
+                ParseTimestamp(entry.updatedAt),
+                entry.lastStatusCode,
+                entry.lastError);
         }
 
         static DateTimeOffset ParseTimestamp(string value)
@@ -104,15 +107,14 @@ namespace PlayerVault.Internal
         }
 
         /// <summary>
-        /// A minimal check that a successful response actually carried a JSON object.
+        /// A basic check that a successful response contains a JSON object.
         /// </summary>
         /// <remarks>
-        /// This exists because of a specific trap: Unity's DownloadHandlerBuffer does no
-        /// parsing, so an HTML error page from a proxy arrives as
-        /// <c>UnityWebRequest.Result.Success</c>. Without this check the SDK would grant a
-        /// reward on the strength of a 502 page. The check is deliberately shallow — it
-        /// must not assume the sample endpoint's echo shape, because a game swapping in its
-        /// own backend will return something else entirely.
+        /// Unity's DownloadHandlerBuffer does not parse the body, so an HTML error page from a
+        /// proxy can arrive as <c>UnityWebRequest.Result.Success</c>. Without this check, such
+        /// a page would grant the reward. The check is kept simple and does not assume the
+        /// sample endpoint's response format, since a game's own backend will respond
+        /// differently.
         /// </remarks>
         public static bool LooksLikeJsonObject(string body)
         {

@@ -7,20 +7,20 @@ namespace PlayerVault
     public enum CorruptDataPolicy
     {
         /// <summary>
-        /// Move the unreadable file aside and start fresh. The default: a player who
-        /// cannot launch the game is worse off than one who lost progress, and the
-        /// quarantined file keeps support recovery possible.
+        /// Move the unreadable file aside and start with a new save. This is the default:
+        /// losing progress is better than a game that cannot start, and the moved file can
+        /// still be recovered.
         /// </summary>
         Quarantine,
 
-        /// <summary>Fail loudly at open time and let the game decide.</summary>
+        /// <summary>Throw when opening and let the game decide.</summary>
         Throw
     }
 
     /// <summary>When balance changes reach disk.</summary>
     public enum FlushMode
     {
-        /// <summary>Write on every mutation. Correct by default.</summary>
+        /// <summary>Write on every change. This is the default.</summary>
         Immediate,
 
         /// <summary>Coalesce writes within <see cref="VaultConfig.DebounceInterval"/>.</summary>
@@ -28,12 +28,12 @@ namespace PlayerVault
     }
 
     /// <summary>
-    /// Everything the vault needs. Every seam has a working default, so the minimum
-    /// viable config is a player id and a list of resources.
+    /// Vault settings. Every dependency has a default, so the minimum config is a player id
+    /// and a list of resources.
     /// </summary>
     public sealed class VaultConfig
     {
-        /// <summary>Required. Also keys the storage file, so switching player switches ledger.</summary>
+        /// <summary>Required. Also used as the save file key, so each player has a separate save.</summary>
         public string PlayerId { get; set; }
 
         public string ApiUrl { get; set; } = "https://httpbin.org/anything";
@@ -41,13 +41,13 @@ namespace PlayerVault
         public IList<ResourceDefinition> Resources { get; set; } = new List<ResourceDefinition>();
 
         /// <summary>
-        /// When false (the default) a resource not declared in <see cref="Resources"/> is
-        /// refused, which catches typos. When true, unknown resources spring into existence
-        /// on first use with no maximum.
+        /// When false (the default), resources not listed in <see cref="Resources"/> are
+        /// refused, which catches typos. When true, unknown resources are created on first use
+        /// with no maximum.
         /// </summary>
         public bool AllowUndeclaredResources { get; set; }
 
-        /// <summary>Replay unfinished claims when the vault opens. Runs detached; opening never blocks on the network.</summary>
+        /// <summary>Retry unfinished claims when the vault opens. Runs in the background; opening does not wait for the network.</summary>
         public bool ResumePendingOnOpen { get; set; } = true;
 
         public CorruptDataPolicy OnCorruptData { get; set; } = CorruptDataPolicy.Quarantine;
@@ -74,9 +74,8 @@ namespace PlayerVault
         /// Validates the configuration. Called by the Vault constructor.
         /// </summary>
         /// <remarks>
-        /// The SDK throws at configuration time and returns results at runtime. A bad
-        /// config is a programming error and should fail loudly on the first frame;
-        /// an insufficient balance is a normal event and should never throw.
+        /// Configuration errors throw. Runtime failures such as an insufficient balance are
+        /// returned as results instead.
         /// </remarks>
         public void Validate()
         {

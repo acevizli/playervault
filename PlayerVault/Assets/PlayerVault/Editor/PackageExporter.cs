@@ -5,14 +5,21 @@ using UnityEngine;
 namespace PlayerVault.Editor
 {
     /// <summary>
-    /// Exports the SDK as a .unitypackage for consumption by a game project.
-    /// Deliberately exports only Assets/PlayerVault/Runtime — tests, this editor
-    /// script and the samples are development artifacts, not part of the SDK a
-    /// game imports.
+    /// Exports the SDK as a .unitypackage for use in a game project.
     /// </summary>
+    /// <remarks>
+    /// The package contains Runtime, the readme and the sample. The tests and this script are
+    /// only used to develop the SDK and are left out.
+    /// </remarks>
     public static class PackageExporter
     {
-        const string SourceFolder = "Assets/PlayerVault/Runtime";
+        static readonly string[] SourcePaths =
+        {
+            "Assets/PlayerVault/Runtime",
+            "Assets/PlayerVault/Samples",
+            "Assets/PlayerVault/README.md"
+        };
+
         const string OutputName = "PlayerVault.unitypackage";
 
         [MenuItem("PlayerVault/Export .unitypackage")]
@@ -21,7 +28,7 @@ namespace PlayerVault.Editor
             var outputPath = Path.GetFullPath(Path.Combine(Application.dataPath, "..", "..", OutputName));
 
             AssetDatabase.ExportPackage(
-                SourceFolder,
+                SourcePaths,
                 outputPath,
                 ExportPackageOptions.Recurse);
 

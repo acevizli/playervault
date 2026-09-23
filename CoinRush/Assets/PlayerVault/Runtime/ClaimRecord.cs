@@ -3,9 +3,8 @@ using System;
 namespace PlayerVault
 {
     /// <summary>
-    /// The durable record of a reward claim. Immutable — the vault replaces records
-    /// rather than mutating them, so a record handed to game code can never change
-    /// underneath it.
+    /// The saved record of a reward claim. Immutable: the vault replaces records instead of
+    /// changing them, so a record held by game code never changes.
     /// </summary>
     public sealed class ClaimRecord
     {
@@ -16,8 +15,8 @@ namespace PlayerVault
         public long AmountRequested { get; }
 
         /// <summary>
-        /// What actually landed in the balance. Lower than <see cref="AmountRequested"/>
-        /// when a maximum balance clamped it, and zero until the claim is granted.
+        /// How much was added to the balance. Lower than <see cref="AmountRequested"/> if the
+        /// maximum clamped it, and zero until the claim is granted.
         /// </summary>
         public long AmountApplied { get; }
 
@@ -30,8 +29,24 @@ namespace PlayerVault
         public DateTimeOffset CreatedAt { get; }
         public DateTimeOffset UpdatedAt { get; }
 
-        /// <summary>True when the claim is clamped and the player received less than the reward stated.</summary>
+        /// <summary>
+        /// HTTP status of the most recent attempt, or -1 when no response was processed.
+        /// Zero means nothing has been sent yet.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="ClaimFailure.Network"/> alone does not say whether the request was
+        /// throttled, blocked by a proxy or never sent. This field does.
+        /// </remarks>
+        public int LastStatusCode { get; }
+
+        /// <summary>Transport-level detail from the most recent attempt. For display and logs only.</summary>
+        public string LastError { get; }
+
+        /// <summary>True when the maximum clamped the reward and the player received less than requested.</summary>
         public bool WasClamped => Status == ClaimStatus.Granted && AmountApplied < AmountRequested;
+
+        /// <summary>True when the claim has been sent at least once and is still pending.</summary>
+        public bool IsAwaitingRetry => Status == ClaimStatus.Pending && Attempts > 0;
 
         internal ClaimRecord(
             string rewardId,
@@ -42,7 +57,9 @@ namespace PlayerVault
             ClaimFailure failure,
             int attempts,
             DateTimeOffset createdAt,
-            DateTimeOffset updatedAt)
+            DateTimeOffset updatedAt,
+            int lastStatusCode = 0,
+            string lastError = null)
         {
             RewardId = rewardId;
             Resource = resource;
@@ -53,6 +70,8 @@ namespace PlayerVault
             Attempts = attempts;
             CreatedAt = createdAt;
             UpdatedAt = updatedAt;
+            LastStatusCode = lastStatusCode;
+            LastError = lastError;
         }
 
         internal ClaimRecord With(
@@ -60,7 +79,9 @@ namespace PlayerVault
             ClaimFailure? failure = null,
             long? amountApplied = null,
             int? attempts = null,
-            DateTimeOffset? updatedAt = null)
+            DateTimeOffset? updatedAt = null,
+            int? lastStatusCode = null,
+            string lastError = null)
         {
             return new ClaimRecord(
                 RewardId,
@@ -71,7 +92,40 @@ namespace PlayerVault
                 failure ?? Failure,
                 attempts ?? Attempts,
                 CreatedAt,
-                updatedAt ?? UpdatedAt);
+                updatedAt ?? UpdatedAt,
+                lastStatusCode ?? LastStatusCode,
+                lastError ?? LastError);
+        }
+
+        /// <summary>A one-line description for a HUD or log.</summary>
+        public string Describe()
+        {
+            switch (Status)
+            {
+                case ClaimStatus.Granted:
+                    return WasClamped
+                        ? $"granted {AmountApplied} of {AmountRequested} {Resource} (the rest overflowed the cap)"
+                        : $"granted {AmountApplied} {Resource}";
+
+                case ClaimStatus.AlreadyGranted:
+                    return $"already granted {AmountApplied} {Resource}";
+
+                case ClaimStatus.Failed:
+                    return $"failed ({Failure}){DetailSuffix()}";
+
+                default:
+                    return Attempts == 0
+                        ? $"not sent yet ({Failure})"
+                        : $"pending after {Attempts} attempt(s) ({Failure}){DetailSuffix()}";
+            }
+        }
+
+        string DetailSuffix()
+        {
+            if (LastStatusCode > 0 && !string.IsNullOrEmpty(LastError)) return $" — HTTP {LastStatusCode}: {LastError}";
+            if (LastStatusCode > 0) return $" — HTTP {LastStatusCode}";
+            if (!string.IsNullOrEmpty(LastError)) return $" — {LastError}";
+            return string.Empty;
         }
 
         public override string ToString() =>

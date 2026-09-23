@@ -154,9 +154,8 @@ namespace PlayerVault.Tests
         [Test]
         public void A_success_carrying_a_non_JSON_body_does_not_grant()
         {
-            // The trap from the research: Unity's download handler does no parsing, so a
-            // proxy's HTML error page arrives as Result.Success. Granting on that would be
-            // a reward handed out on the strength of a 502.
+            // Unity does not parse the response, so a proxy's HTML error page arrives as
+            // Result.Success. It must not grant the reward.
             var transport = FakeTransport.Always(
                 TransportResponse.Success(200, "<html><body>502 Bad Gateway</body></html>"));
             using var vault = Open(Config(transport));

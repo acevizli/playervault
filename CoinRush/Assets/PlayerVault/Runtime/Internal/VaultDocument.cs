@@ -4,15 +4,13 @@ using System.Collections.Generic;
 namespace PlayerVault.Internal
 {
     /// <summary>
-    /// The on-disk shape. One document holds balances, claims and — implicitly — the
-    /// granted-reward guard, so a single atomic write commits all three together.
+    /// The saved file format. One document holds balances and claims (the granted set is
+    /// derived from the claims), so a single atomic write saves all of it.
     /// </summary>
     /// <remarks>
-    /// Public fields rather than properties, and a list of key/value pairs rather than a
-    /// dictionary, because <c>UnityEngine.JsonUtility</c> serializes neither properties
-    /// nor dictionaries. The alternative was taking a dependency on Newtonsoft, which
-    /// every consuming game would then inherit — a poor trade for a package whose whole
-    /// selling point is dropping into any project.
+    /// Uses public fields and a list of key/value pairs because <c>UnityEngine.JsonUtility</c>
+    /// cannot serialize properties or dictionaries. Using Newtonsoft instead would add a
+    /// dependency to every game that imports the package.
     /// </remarks>
     [Serializable]
     public class VaultDocument
@@ -33,8 +31,8 @@ namespace PlayerVault.Internal
     }
 
     /// <summary>
-    /// Enums are stored as strings, not ints, so a reordered enum cannot silently
-    /// reinterpret a player's saved claims as something else.
+    /// Enums are stored as strings, so reordering an enum does not change the meaning of
+    /// saved claims.
     /// </summary>
     [Serializable]
     public class ClaimEntry
@@ -48,11 +46,17 @@ namespace PlayerVault.Internal
         public int attempts;
         public string createdAt;
         public string updatedAt;
+
+        // Diagnostics. Added after schema 1 without a version bump: JsonUtility ignores
+        // unknown fields and fills missing ones with defaults, so old and new builds can
+        // read each other's files.
+        public int lastStatusCode;
+        public string lastError;
     }
 
     /// <summary>
-    /// The request body, matching the shape the case specifies. Field names are literally
-    /// snake_case because JsonUtility cannot rename fields on the way out.
+    /// The claim request body. Field names are snake_case because JsonUtility cannot rename
+    /// fields when serializing.
     /// </summary>
     [Serializable]
     public class ClaimRequestBody

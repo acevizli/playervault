@@ -15,9 +15,8 @@ namespace PlayerVault
         public long Initial { get; set; }
 
         /// <summary>
-        /// Optional ceiling. Null means unbounded. A claim that would exceed the maximum
-        /// is clamped, not rejected — the reward was already accepted by the backend, so
-        /// refusing it locally would strand it forever.
+        /// Optional maximum. Null means no limit. A claim that would go over the maximum is
+        /// clamped instead of rejected, because the backend has already accepted it.
         /// </summary>
         public long? Max { get; set; }
 

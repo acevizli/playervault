@@ -7,10 +7,9 @@ namespace PlayerVault
     /// How the SDK talks to a reward backend.
     /// </summary>
     /// <remarks>
-    /// This is deliberately the narrowest interface in the SDK: one method, no Unity
-    /// types. A fake is about ten lines, which is what makes the whole test suite
-    /// runnable without a network. Substituting a real implementation is how a game
-    /// points PlayerVault at its own backend instead of the sample endpoint.
+    /// One method and no Unity types, so a test fake is about ten lines and the tests run
+    /// without a network. A game implements this to use its own backend instead of the
+    /// sample endpoint.
     /// </remarks>
     public interface IVaultTransport
     {
@@ -18,24 +17,23 @@ namespace PlayerVault
     }
 
     /// <summary>
-    /// How the SDK should treat a transport attempt. Classification lives in the
-    /// transport because only the transport can see the underlying failure.
+    /// How the SDK should treat a request result. The transport decides this because only it
+    /// can see the underlying error.
     /// </summary>
     public enum TransportOutcome
     {
         /// <summary>2xx with a body.</summary>
         Success,
 
-        /// <summary>4xx. Deterministic — retrying will fail the same way.</summary>
+        /// <summary>4xx. Retrying would fail the same way.</summary>
         Rejected,
 
         /// <summary>5xx or 429. The server saw the request and could not serve it.</summary>
         Retryable,
 
         /// <summary>
-        /// No response was processed: no connection, DNS failure, TLS failure, timeout, abort.
-        /// Critically this does NOT mean the server did nothing — a client-side timeout does
-        /// not cancel server-side work, so the claim's true outcome is unknown.
+        /// No response arrived: no connection, DNS failure, TLS failure, timeout or abort. The
+        /// server may still have processed the request, so the outcome is unknown.
         /// </summary>
         Indeterminate
     }
@@ -49,7 +47,7 @@ namespace PlayerVault
 
         public string Body { get; }
 
-        /// <summary>Transport-level detail for logging. Never parsed or branched on.</summary>
+        /// <summary>Error detail for logging. The SDK does not parse it.</summary>
         public string Error { get; }
 
         public TransportResponse(TransportOutcome outcome, int statusCode, string body, string error = null)
