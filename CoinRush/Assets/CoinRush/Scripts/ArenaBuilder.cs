@@ -4,13 +4,12 @@ using UnityEngine;
 namespace CoinRush
 {
     /// <summary>
-    /// Lays out the collectables and hazards at runtime, from a <see cref="LevelDefinition"/>.
+    /// Places the coins and hazards at runtime from a <see cref="LevelDefinition"/>.
     ///
-    /// Coins and hazards are generated rather than placed by hand in the scene. A ring layout is a few
-    /// lines of trigonometry, it rebuilds instantly when the level restarts, and — as an earlier
-    /// ticket demonstrated painfully — hand-placed objects in the Editor are exactly where transform
-    /// mistakes come from. The trade is that you cannot art-direct an individual coin, which for a
-    /// test arena is not a cost worth paying to avoid.
+    /// They are generated instead of placed by hand in the scene. A ring layout takes a few lines
+    /// of trigonometry, rebuilds instantly when the level restarts, and avoids the transform
+    /// mistakes that hand-placed objects caused earlier. The downside is that individual coins
+    /// cannot be positioned by hand.
     /// </summary>
     public sealed class ArenaBuilder : MonoBehaviour
     {
@@ -49,15 +48,14 @@ namespace CoinRush
                 _coins.Add(CreateCoin(PointOnRing(i, level.coinCount, level.coinRingRadius, coinHeight)));
             }
 
-            // Hazards share a container purely for tidiness in the hierarchy. Each one steers
-            // itself, so there is nothing for a parent transform to drive.
+            // The container only keeps the hierarchy tidy. Each hazard moves itself.
             var hazardRoot = new GameObject("Hazards").transform;
             hazardRoot.SetParent(_container, worldPositionStays: false);
 
             for (var i = 0; i < level.hazardCount; i++)
             {
-                // Spawned evenly on a ring, offset half a step so they do not start on top of the
-                // coins. Where they go after that is their own business.
+                // Spread evenly on a ring, offset half a step so they do not start on top of
+                // the coins.
                 const float angleOffset = 0.5f;
                 var position = PointOnRing(
                     i + angleOffset, level.hazardCount, level.hazardRingRadius, hazardSize * 0.5f);
@@ -91,10 +89,9 @@ namespace CoinRush
 
         Coin CreateCoin(Vector3 position)
         {
-            // The trigger lives on an empty parent with uniform scale, and the flattened cylinder is a
-            // child. Putting a collider on the squashed mesh itself would inherit that non-uniform
-            // scale, and Unity scales a SphereCollider by the largest axis — the coin would grab the
-            // ball from further away than it looks.
+            // The trigger is on an empty parent with uniform scale, and the flattened cylinder is a
+            // child. On the squashed mesh itself, Unity would scale the SphereCollider by the
+            // largest axis and the coin would be collected from further away than it looks.
             var root = new GameObject("Coin");
             root.transform.SetParent(_container, worldPositionStays: false);
             root.transform.position = position;
@@ -123,13 +120,12 @@ namespace CoinRush
             block.transform.localScale = Vector3.one * hazardSize;
             Paint(block, hazardMaterial);
 
-            // A trigger, not a solid body: bouncing off a hazard and losing a life at the same time
-            // reads as two punishments for one mistake.
+            // A trigger instead of a solid collider, so touching a hazard costs a life without also
+            // bouncing the ball away.
             block.GetComponent<BoxCollider>().isTrigger = true;
 
-            // Kinematic body on a collider that moves every frame. Without one the physics engine
-            // treats it as static geometry and rebuilds its broadphase tree on every step, which is
-            // the documented way to make a dozen drifting triggers cost more than the whole game.
+            // A kinematic Rigidbody, because the collider moves every frame. Without one, Unity
+            // treats it as static and rebuilds its broadphase every physics step, which is slow.
             var body = block.AddComponent<Rigidbody>();
             body.isKinematic = true;
             body.useGravity = false;

@@ -5,13 +5,13 @@ using UnityEngine;
 
 namespace CoinRush
 {
-    /// <summary>The phase the level is in. Drives what the HUD shows and whether input matters.</summary>
+    /// <summary>The current phase. Controls what the HUD shows and whether input is used.</summary>
     public enum LevelPhase
     {
         /// <summary>The vault has not finished opening. Nothing is playable yet.</summary>
         Booting,
 
-        /// <summary>The level select is up. The arena is torn down and nothing is rolling.</summary>
+        /// <summary>The level select is showing. The arena is cleared.</summary>
         Menu,
 
         Playing,
@@ -20,16 +20,13 @@ namespace CoinRush
     }
 
     /// <summary>
-    /// Owns the run: laying out the level, reacting to pickups and deaths, deciding when the run is
-    /// over, and selling the next level for coins.
+    /// Runs a level: builds it, handles pickups and lost lives, decides when the run ends, and
+    /// sells locked levels for coins.
     ///
-    /// It does not own the <i>numbers</i>. Coins, lives and even which levels are unlocked are
-    /// PlayerVault resources, so this class reads balances rather than tracking them, and every
-    /// change arrives back through <see cref="VaultBehaviour.BalanceChanged"/> rather than being
-    /// pushed out from here. That inversion is what lets a pending claim replayed at launch — from a
-    /// session that was offline when the level was cleared — move the HUD without a single line of
-    /// game code being involved. It is also why progression survives a reinstall of the scene: the
-    /// vault is the save file.
+    /// Coins, lives and unlocked levels are PlayerVault resources. This class reads balances
+    /// instead of storing them, and changes come back through
+    /// <see cref="VaultBehaviour.BalanceChanged"/>. That way a pending claim retried at launch
+    /// updates the HUD without any extra game code, and the vault is the save file.
     /// </summary>
     public sealed class LevelController : MonoBehaviour
     {
@@ -38,26 +35,19 @@ namespace CoinRush
         public const string LivesResource = "lives";
 
         /// <summary>
-        /// Every level past the first owns an entitlement resource — <c>level-3-unlocked</c> and so
-        /// on — declared with a maximum of 1.
+        /// Each level after the first has an unlock resource, such as <c>level-3-unlocked</c>,
+        /// with a maximum of 1.
         /// </summary>
         /// <remarks>
-        /// This started life as a single <c>levels</c> counter, which could only ever describe a
-        /// prefix of the list. Levels are bought in any order now, so what is being stored is a
-        /// <i>set</i>, not a count. Keeping it as resources rather than a PlayerPrefs blob means
-        /// unlocking is a <see cref="Vault.SpendAsync"/> and a <see cref="Vault.GrantLocal"/>
-        /// against the same durable document as everything else — one save file, one write, no
-        /// second persistence mechanism to keep in step. A resource capped at 1 is how this SDK
-        /// spells a boolean: the vault refuses the second grant itself, so a double tap on a
-        /// purchase cannot charge twice.
+        /// Levels can be bought in any order, so each one needs its own flag instead of a single
+        /// level counter. Storing them as vault resources means a purchase is one
+        /// <see cref="Vault.TransactAsync"/> call in the same save as everything else. A resource
+        /// with a maximum of 1 works as a boolean: the vault refuses a second grant, so a double
+        /// tap cannot charge twice.
         /// </remarks>
         const string UnlockKeyFormat = "level-{0}-unlocked";
 
-        /// <summary>
-        /// Reward ids are derived from the level's position, not authored per level. Hand-typed ids
-        /// are a duplicate away from two levels sharing a once-only reward, and the vault would
-        /// honour that duplicate exactly as asked.
-        /// </summary>
+        /// <summary>The fallback reward id for a level with none authored.</summary>
         const string RewardIdFormat = "level-{0}-first-clear";
 
         [Header("Scene")]
@@ -75,9 +65,7 @@ namespace CoinRush
         Vault _vault;
 
         /// <summary>
-        /// Which level the player picked. Previously derived from the unlock count, which quietly
-        /// meant the newest level was the only one playable — clearing level five left no way back
-        /// to level one.
+        /// The level the player picked. Stored separately so any unlocked level can be replayed.
         /// </summary>
         int _selected;
 
@@ -89,8 +77,17 @@ namespace CoinRush
         /// <summary>The claim for the level being played, or null if it has never been cleared.</summary>
         public ClaimRecord Claim { get; private set; }
 
-        /// <summary>How many claims the vault is still trying to settle. Zero most of the time.</summary>
+        /// <summary>How many claims are still pending. Usually zero.</summary>
         public int PendingClaimCount { get; private set; }
+
+        /// <summary>Whether the retry button should be shown.</summary>
+        /// <remarks>
+        /// The vault retries pending rewards on the next launch anyway, so a retry that changed
+        /// nothing is not offered again right away. The button hides when tapped and comes back
+        /// when the set of pending claims changes or the app returns to the foreground. The HUD
+        /// keeps showing that a reward is pending either way.
+        /// </remarks>
+        public bool RetryOffered { get; private set; }
 
         /// <summary>The open vault, for read-only inspection. Null until it opens.</summary>
         public Vault Vault => _vault;
@@ -98,7 +95,7 @@ namespace CoinRush
         public long Coins => _vault?.GetBalance(CoinsResource) ?? 0;
         public long Lives => _vault?.GetBalance(LivesResource) ?? 0;
 
-        /// <summary>The lives ceiling, so the HUD can render "2/3" rather than a bare "2".</summary>
+        /// <summary>The lives maximum, so the HUD can show "2/3" instead of "2".</summary>
         public long? LivesMax => _vault?.GetMax(LivesResource);
 
         public int LevelCount => levels.Count;
@@ -111,10 +108,29 @@ namespace CoinRush
 
         public LevelDefinition LevelAt(int index) => levels[index];
 
-        /// <summary>The entitlement resource key for a level, derived from its position.</summary>
-        public static string UnlockKeyFor(int index) => string.Format(UnlockKeyFormat, index + 1);
+        /// <summary>
+        /// The unlock resource key for a level: the one set on the level, or one based on its
+        /// position.
+        /// </summary>
+        public string UnlockKeyFor(int index) =>
+            Authored(index, levels.Count > index && index >= 0 ? levels[index].unlockKey : null, UnlockKeyFormat);
 
-        /// <summary>The first level is free; every other one is an entitlement the vault holds.</summary>
+        /// <summary>The one-time reward id for a level: the one set on it, or one based on its position.</summary>
+        public string RewardIdFor(int index) =>
+            Authored(index, levels.Count > index && index >= 0 ? levels[index].rewardId : null, RewardIdFormat);
+
+        /// <summary>
+        /// Uses the id set on the level; if it is empty, falls back to one based on position.
+        /// </summary>
+        /// <remarks>
+        /// Position-based ids break when levels are inserted or reordered: every level after the
+        /// change gets a different id, so saved rewards move to the wrong level. Ids set by hand do
+        /// not change, and <see cref="WarnIfIdsCollide"/> catches duplicates.
+        /// </remarks>
+        static string Authored(int index, string authored, string format) =>
+            string.IsNullOrWhiteSpace(authored) ? string.Format(format, index + 1) : authored.Trim();
+
+        /// <summary>The first level is free; the others are unlocked through vault resources.</summary>
         public bool IsUnlocked(int index) =>
             index == 0 || (_vault != null && _vault.GetBalance(UnlockKeyFor(index)) > 0);
 
@@ -122,9 +138,8 @@ namespace CoinRush
             index >= 0 && index < levels.Count ? levels[index].unlockCost : 0;
 
         /// <summary>
-        /// Whether a locked level is affordable right now. The vault answers this, not the game —
-        /// and it answers it without regard to claims in flight, which is the point: a reward still
-        /// settling with the backend never reserves or freezes the balance the player already has.
+        /// Whether the player can afford a locked level right now. The vault decides, and pending
+        /// claims do not reserve any of the balance.
         /// </summary>
         public bool CanAfford(int index) =>
             _vault != null && _vault.CanSpend(CoinsResource, UnlockCostOf(index));
@@ -136,25 +151,26 @@ namespace CoinRush
         /// Raised with the outcome of a claim and the record behind it.
         /// </summary>
         /// <remarks>
-        /// The status is carried separately from the record on purpose. A reward claimed a second
-        /// time comes back as <see cref="ClaimStatus.AlreadyGranted"/> wrapping the <i>original</i>
-        /// record, which is still <see cref="ClaimStatus.Granted"/> — correctly, because that is
-        /// what happened the first time. A listener that reads only the record therefore announces
-        /// a fresh grant on every replay, which is exactly the double-reward the SDK exists to
-        /// prevent, faked by the game on top of an SDK that refused it.
+        /// The status is passed separately from the record. Claiming a reward again returns
+        /// <see cref="ClaimStatus.AlreadyGranted"/> with the original record, whose status is still
+        /// <see cref="ClaimStatus.Granted"/>. A listener that only read the record would show a new
+        /// reward every time the level is replayed.
         /// </remarks>
         public event Action<ClaimStatus, ClaimRecord> ClaimChanged;
 
         /// <summary>Raised when the level being played changes, or is rebuilt.</summary>
         public event Action<LevelDefinition> LevelChanged;
 
-        /// <summary>Raised when the number of unsettled claims changes.</summary>
+        /// <summary>Raised when the number of pending claims changes.</summary>
         public event Action<int> PendingClaimsChanged;
 
-        /// <summary>Raised when the set of unlocked levels changes, so the menu can re-read it.</summary>
+        /// <summary>Raised when <see cref="RetryOffered"/> changes, so the HUD can show or hide the button.</summary>
+        public event Action<bool> RetryOfferChanged;
+
+        /// <summary>Raised when the set of unlocked levels changes, so the menu can refresh.</summary>
         public event Action UnlocksChanged;
 
-        /// <summary>Short-lived messages for the HUD: clamped grants, refused purchases.</summary>
+        /// <summary>Short messages for the HUD, such as clamped grants or refused purchases.</summary>
         public event Action<string> Notice;
 
         void Start()
@@ -176,8 +192,11 @@ namespace CoinRush
                 return;
             }
 
-            // IsOpen is checked before subscribing because VaultBehaviour sets Vault and raises Opened
-            // back to back; a listener attached afterwards would wait for an event that already fired.
+            // Check IsOpen first: VaultBehaviour sets Vault and raises Opened together, so a
+            // listener added afterwards would miss the event. A failed open is also handled, so the
+            // player is told their progress could not be loaded instead of seeing every level locked.
+            vaultBehaviour.OpenFailed += OnVaultOpenFailed;
+
             if (vaultBehaviour.IsOpen)
             {
                 OnVaultOpened(vaultBehaviour.Vault);
@@ -198,6 +217,7 @@ namespace CoinRush
             if (vaultBehaviour != null)
             {
                 vaultBehaviour.Opened -= OnVaultOpened;
+                vaultBehaviour.OpenFailed -= OnVaultOpenFailed;
                 vaultBehaviour.BalanceChanged -= OnBalanceChanged;
                 vaultBehaviour.ClaimStateChanged -= OnClaimStateChanged;
             }
@@ -206,11 +226,9 @@ namespace CoinRush
         }
 
         /// <summary>
-        /// Replays the current level. Wired to the HUD's full-screen tap catcher rather than read
-        /// from the pointer here: a raw pointer read cannot tell whether the tap landed on the unlock
-        /// button, and the frame ordering between this component and the EventSystem is not defined,
-        /// so the same tap could both buy a level and restart the old one. Letting uGUI's own raycast
-        /// sorting decide removes the race rather than papering over it.
+        /// Replays the current level. Called by the HUD's full-screen tap button instead of reading
+        /// the pointer here. A pointer read cannot tell whether the tap hit the unlock button, so one
+        /// tap could both buy a level and restart the old one. uGUI's raycasting avoids that.
         /// </summary>
         public void RequestReplay()
         {
@@ -222,16 +240,16 @@ namespace CoinRush
         {
             _vault = vault;
 
-            // Subscribed on the wrapper, not on the vault itself. The vault raises its events on
-            // whichever thread finished the work, and these handlers end up writing HUD text — which
-            // is a main-thread-only operation. VaultBehaviour re-raises them on the main thread.
+            // Subscribe on VaultBehaviour instead of the vault. The vault raises events on background
+            // threads, and these handlers update HUD text, which must happen on the main thread.
             vaultBehaviour.BalanceChanged += OnBalanceChanged;
             vaultBehaviour.ClaimStateChanged += OnClaimStateChanged;
 
             WarnIfUnlockResourcesMissing();
+            WarnIfIdsCollide();
 
-            // A claim left unfinished by an earlier session is already being replayed by now — the
-            // vault resumes on open. Surface whatever it knows so the HUD is honest from frame one.
+            // The vault is already retrying claims left from an earlier session. Show their current
+            // state in the HUD from the start.
             Claim = _vault.GetClaim(RewardIdFor(CurrentIndex));
             if (Claim != null)
             {
@@ -242,18 +260,25 @@ namespace CoinRush
             ShowMenu();
         }
 
+        void OnVaultOpenFailed(Exception exception)
+        {
+            Debug.LogError($"[CoinRush] The vault could not be opened: {exception.Message}");
+            Notice?.Invoke("COULD NOT LOAD YOUR PROGRESS");
+        }
+
         /// <summary>
-        /// The entitlement resources are declared on the VaultBehaviour and the levels live in this
-        /// list — two different files, so they can drift. An undeclared resource is not a crash: the
-        /// vault refuses the grant and the purchase refunds itself. But it is a bug, and it reads far
-        /// better here than as a level that mysteriously refuses to unlock three clears later.
+        /// The unlock resources are declared on the VaultBehaviour and the levels are listed here, so
+        /// the two can get out of sync. A missing resource does not crash (the purchase is refused),
+        /// but it is a bug, so it is logged at startup.
         /// </summary>
         void WarnIfUnlockResourcesMissing()
         {
+            var balances = _vault.Balances;
+
             for (var i = 1; i < levels.Count; i++)
             {
                 var key = UnlockKeyFor(i);
-                if (_vault.Balances.ContainsKey(key)) continue;
+                if (balances.ContainsKey(key)) continue;
 
                 Debug.LogWarning(
                     $"[CoinRush] Level {i + 1} ('{levels[i].name}') has no '{key}' resource declared " +
@@ -262,9 +287,37 @@ namespace CoinRush
         }
 
         /// <summary>
-        /// Tears the arena down and puts the level select up. This is where a run ends up rather
-        /// than being pushed straight into the next level: which level to play is the player's
-        /// choice, and every level they own stays replayable.
+        /// Two levels with the same reward id or unlock key would share progress: clearing one would
+        /// mark both cleared, and buying one would unlock both. Checked once at startup.
+        /// </summary>
+        void WarnIfIdsCollide()
+        {
+            var rewards = new Dictionary<string, int>(StringComparer.Ordinal);
+            var unlocks = new Dictionary<string, int>(StringComparer.Ordinal);
+
+            for (var i = 0; i < levels.Count; i++)
+            {
+                Check(rewards, RewardIdFor(i), i, "reward id");
+                if (i > 0) Check(unlocks, UnlockKeyFor(i), i, "unlock key");
+            }
+
+            void Check(Dictionary<string, int> seen, string id, int index, string what)
+            {
+                if (seen.TryGetValue(id, out var first))
+                {
+                    Debug.LogError(
+                        $"[CoinRush] Levels {first + 1} and {index + 1} share the {what} '{id}'. " +
+                        "Their progress is the same progress; give one of them a distinct id.");
+                    return;
+                }
+
+                seen[id] = index;
+            }
+        }
+
+        /// <summary>
+        /// Clears the arena and shows the level select. After a run the player returns here and
+        /// chooses what to play next; every unlocked level can be replayed.
         /// </summary>
         public void ShowMenu()
         {
@@ -280,9 +333,8 @@ namespace CoinRush
         }
 
         /// <summary>
-        /// Plays a level chosen from the menu. Locked levels are refused here rather than being
-        /// silently bought — spending a player's coins is never a side effect of a tap meant to
-        /// start a game.
+        /// Plays a level chosen from the menu. Locked levels are refused instead of bought, so a tap
+        /// meant to start a level never spends coins.
         /// </summary>
         public void SelectLevel(int index)
         {
@@ -298,7 +350,7 @@ namespace CoinRush
             StartRun();
         }
 
-        /// <summary>Tops lives back up and lays out the current level.</summary>
+        /// <summary>Refills lives and builds the current level.</summary>
         public void StartRun()
         {
             if (_vault == null || levels.Count == 0)
@@ -306,10 +358,8 @@ namespace CoinRush
                 return;
             }
 
-            // Grant the full allowance and let the resource maximum absorb the excess rather than
-            // computing the difference here. The SDK already knows the ceiling; duplicating that
-            // arithmetic in the game is how the two drift apart. What it grants back is worth
-            // reading: zero applied means the player never lost a life, which is worth saying.
+            // Grant the full amount and let the resource maximum clamp it, instead of computing the
+            // difference here. Zero applied means lives were already full.
             var granted = _vault.GrantLocal(LivesResource, livesPerRun);
             if (!granted.Success)
             {
@@ -333,9 +383,8 @@ namespace CoinRush
                 ball.ResetToSpawn();
             }
 
-            // Read, but deliberately not announced. The claim for a level being replayed is last
-            // run's news, and re-raising it here is what left a "+100 COINS" banner sitting over the
-            // whole of the next run.
+            // Read but not announced. Raising it here left the last run's "+100 COINS" banner on
+            // screen for the whole next run.
             Claim = _vault.GetClaim(RewardIdFor(CurrentIndex));
 
             CoinsChanged?.Invoke(Coins);
@@ -345,9 +394,8 @@ namespace CoinRush
         }
 
         /// <summary>
-        /// Buys any locked level outright, in whatever order the player can afford them. Refusals
-        /// come back as a <see cref="Notice"/> rather than an exception, because running out of
-        /// money is an ordinary thing for a player to do.
+        /// Buys a locked level. Levels can be bought in any order. A refused purchase is shown as a
+        /// <see cref="Notice"/>.
         /// </summary>
         public void TryUnlock(int index)
         {
@@ -356,38 +404,35 @@ namespace CoinRush
 
             var cost = UnlockCostOf(index);
 
-            // Asked before spending so the refusal can be specific. Spend would refuse it anyway —
-            // this is a nicer message, not a second source of truth.
+            // Checked first only to show a clearer message. The transaction would refuse it anyway.
             if (!_vault.CanSpend(CoinsResource, cost))
             {
                 Notice?.Invoke($"NEED {cost - Coins} MORE COINS");
                 return;
             }
 
-            // SpendRoutine, not Spend: this is a purchase, and the deduction should be on disk
-            // before the player is handed the thing they bought. A crash in between would otherwise
-            // give the level away for free.
-            StartCoroutine(vaultBehaviour.SpendRoutine(
-                CoinsResource, cost, result => OnUnlockPaid(index, cost, result)));
+            // One transaction instead of a spend and a grant. With two calls, a crash between them
+            // would charge the player without unlocking the level. TransactAsync saves both in
+            // one write.
+            StartCoroutine(vaultBehaviour.TransactRoutine(
+                VaultTransaction.Purchase(CoinsResource, cost, UnlockKeyFor(index)),
+                result => OnUnlockSettled(index, result)));
         }
 
-        void OnUnlockPaid(int index, long cost, SpendResult result)
+        void OnUnlockSettled(int index, TransactionResult result)
         {
             if (!result.Success)
             {
+                // Nothing was charged or granted, so there is nothing to refund.
                 Notice?.Invoke(DescribeSpendFailure(result.Failure));
-                return;
-            }
 
-            var unlocked = _vault.GrantLocal(UnlockKeyFor(index), 1);
-            if (unlocked.AmountApplied == 0)
-            {
-                // Paid for something the vault would not hand over — the resource is undeclared, or
-                // already at its ceiling. Give the coins back rather than leaving the player short.
-                _vault.GrantLocal(CoinsResource, cost);
-                Notice?.Invoke("UNLOCK FAILED - COINS REFUNDED");
-                Debug.LogError(
-                    $"[CoinRush] '{UnlockKeyFor(index)}' refused the unlock ({unlocked.Failure}).");
+                if (result.Failure == SpendFailure.UnknownResource)
+                {
+                    Debug.LogError(
+                        $"[CoinRush] '{result.FailedResource}' is not declared on the VaultBehaviour, " +
+                        $"so level {index + 1} can never be unlocked.");
+                }
+
                 return;
             }
 
@@ -396,15 +441,61 @@ namespace CoinRush
         }
 
         /// <summary>
-        /// Asks the vault to retry everything still in flight, instead of waiting for the next launch.
-        /// The HUD offers this so an offline claim can be seen settling rather than described.
+        /// Asks the vault to retry all pending claims now instead of on the next launch.
         /// </summary>
         public void RetryPendingClaims()
         {
-            if (_vault == null || PendingClaimCount == 0) return;
+            if (_vault == null || !RetryOffered || PendingClaimCount == 0) return;
+
+            // Hide the offer before the retry finishes, so a second tap does not queue another retry.
+            SetRetryOffered(false);
 
             Notice?.Invoke("RETRYING PENDING REWARDS");
-            StartCoroutine(vaultBehaviour.ResumePendingRoutine(RefreshPendingClaims));
+            StartCoroutine(vaultBehaviour.ResumePendingRoutine(OnRetrySettled));
+        }
+
+        /// <summary>
+        /// Called when a manual retry finishes. If the pending claims changed,
+        /// <see cref="RefreshPendingClaims"/> has already shown the button again. If not, the button
+        /// stays hidden and the player is told the reward is saved.
+        /// </summary>
+        void OnRetrySettled()
+        {
+            var before = PendingClaimCount;
+            RefreshPendingClaims();
+
+            if (PendingClaimCount > 0 && PendingClaimCount == before)
+            {
+                Notice?.Invoke("STILL UNREACHABLE - THE REWARD IS SAVED AND RETRIES ON ITS OWN");
+            }
+        }
+
+        /// <summary>
+        /// Returning to the foreground may mean the network is back, so the retry button is shown
+        /// again. Both callbacks are used because platforms differ: iOS pauses a backgrounded app,
+        /// while the Editor only loses focus.
+        /// </summary>
+        void OnApplicationFocus(bool focused)
+        {
+            if (focused) OfferRetryIfPending();
+        }
+
+        void OnApplicationPause(bool paused)
+        {
+            if (!paused) OfferRetryIfPending();
+        }
+
+        void OfferRetryIfPending()
+        {
+            if (PendingClaimCount > 0) SetRetryOffered(true);
+        }
+
+        void SetRetryOffered(bool offered)
+        {
+            if (offered == RetryOffered) return;
+
+            RetryOffered = offered;
+            RetryOfferChanged?.Invoke(offered);
         }
 
         static string DescribeSpendFailure(SpendFailure failure)
@@ -414,12 +505,11 @@ namespace CoinRush
                 case SpendFailure.InsufficientBalance: return "NOT ENOUGH COINS";
                 case SpendFailure.UnknownResource: return "UNKNOWN RESOURCE";
                 case SpendFailure.InvalidAmount: return "INVALID AMOUNT";
+                case SpendFailure.StorageUnavailable: return "COULD NOT SAVE - NOTHING CHARGED";
+                case SpendFailure.AtMaximum: return "ALREADY UNLOCKED";
                 default: return "PURCHASE REFUSED";
             }
         }
-
-        /// <summary>The once-only reward id for a level, derived from its position in the list.</summary>
-        public static string RewardIdFor(int index) => string.Format(RewardIdFormat, index + 1);
 
         void BuildLevel()
         {
@@ -464,9 +554,8 @@ namespace CoinRush
                 return;
             }
 
-            // A pickup is a local grant, not a claim. Nothing server-side authorises picking up a coin
-            // that the game itself just spawned, and routing it through the network would make the
-            // whole economy hostage to connectivity.
+            // A pickup is a local grant, not a claim. The server has no say over coins the game
+            // spawned, and sending each pickup over the network would make play depend on it.
             var granted = _vault.GrantLocal(CoinsResource, coinsPerPickup);
             if (!granted.Success)
             {
@@ -494,9 +583,8 @@ namespace CoinRush
 
             var result = _vault.Spend(LivesResource, 1);
 
-            // A refused spend is the authoritative "no lives left" answer — the vault, not the game,
-            // decides whether the balance covers it. Reading which refusal it was keeps a genuine bug
-            // (a mistyped resource key) from being silently displayed as an ordinary game over.
+            // The vault decides whether there are lives left. Any failure other than
+            // InsufficientBalance is a bug, such as a mistyped resource key, so it is logged.
             if (!result.Success)
             {
                 if (result.Failure != SpendFailure.InsufficientBalance)
@@ -531,22 +619,26 @@ namespace CoinRush
             Freeze();
             SetPhase(LevelPhase.Completed);
 
-            // The coroutine bridge rather than `await vault.ClaimAsync(...)`. Awaiting directly is
-            // fine for the claim itself, but the continuation resumes on the thread pool, and the
-            // first thing this wants to do with the result is put it on screen. A coroutine is driven
-            // by Unity's own loop, so the callback is on the main thread by construction.
+            // Uses the coroutine instead of `await vault.ClaimAsync(...)`. An await in a
+            // MonoBehaviour usually resumes on the main thread too, but a coroutine always does
+            // because Unity drives it. The vault's events are different: they arrive on background
+            // threads, which is why they are read through VaultBehaviour.
             StartCoroutine(vaultBehaviour.ClaimRoutine(
                 RewardIdFor(CurrentIndex), CoinsResource, CurrentLevel.firstClearReward, OnClaimCompleted));
         }
 
         void OnClaimCompleted(ClaimResult result)
         {
-            // AlreadyGranted returns without sending a request, and so without moving the claim's
-            // state — ClaimStateChanged never fires for it. Reading the returned result is what makes
-            // the second clear of the level say so rather than silently showing nothing.
+            RefreshPendingClaims();
+
+            // Only show the result if it is for the level on screen. A slow claim for one level can
+            // finish after the player has started another.
+            if (result.Record == null || result.Record.RewardId != RewardIdFor(CurrentIndex)) return;
+
+            // AlreadyGranted does not change the claim, so ClaimStateChanged does not fire for it.
+            // Reading the result here lets the HUD show it on a repeat clear.
             Claim = result.Record;
             ClaimChanged?.Invoke(result.Status, Claim);
-            RefreshPendingClaims();
         }
 
         void OnBalanceChanged(string resource, long balance)
@@ -554,9 +646,8 @@ namespace CoinRush
             if (resource == CoinsResource) CoinsChanged?.Invoke(balance);
             else if (resource == LivesResource) LivesChanged?.Invoke(balance);
 
-            // Anything else this game declares is a level entitlement. Routing the notification
-            // through the vault's own event rather than raising it from the purchase path means a
-            // grant from anywhere — a restored save, a future cheat menu — reaches the level select.
+            // Every other resource in this game is a level unlock. Using the vault event instead of
+            // the purchase path means the level select updates however the unlock happened.
             else UnlocksChanged?.Invoke();
         }
 
@@ -579,6 +670,12 @@ namespace CoinRush
             if (count == PendingClaimCount) return;
 
             PendingClaimCount = count;
+
+            // Show the retry button again when the pending set changes: a new pending reward has not
+            // been retried by hand yet, and one that just finished means the network is up. Set
+            // before raising either event so both handlers see the same state.
+            SetRetryOffered(count > 0);
+
             PendingClaimsChanged?.Invoke(count);
         }
 
@@ -589,8 +686,8 @@ namespace CoinRush
                 return;
             }
 
-            // Disabling the controller stops it reading input and applying force, but leaves the
-            // Rigidbody simulated so the ball settles naturally instead of stopping dead in mid-air.
+            // Disabling the controller stops input and forces but keeps the Rigidbody simulated,
+            // so the ball comes to rest instead of freezing in the air.
             ball.enabled = false;
         }
 

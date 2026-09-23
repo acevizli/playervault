@@ -3,17 +3,16 @@ using UnityEngine;
 namespace CoinRush
 {
     /// <summary>
-    /// Walks a hazard around the arena on its own heading, turning at random and bouncing off an
+    /// Moves a hazard around the arena in its own direction, turning at random and bouncing off an
     /// invisible circular boundary.
     ///
-    /// The earlier version orbited the whole hazard ring rigidly, which made the danger a pattern to
-    /// memorise rather than a thing to watch. Independent wandering costs one vector per hazard and
-    /// makes every run of the same level play differently.
+    /// An earlier version rotated the whole ring of hazards together, which was easy to memorise.
+    /// Moving each hazard on its own makes each run of a level play differently.
     /// </summary>
     [RequireComponent(typeof(Rigidbody))]
     public sealed class HazardMotion : MonoBehaviour
     {
-        /// <summary>Largest course correction applied at a turn, in degrees either way.</summary>
+        /// <summary>Largest turn applied at a direction change, in degrees either way.</summary>
         const float MaxTurnDegrees = 70f;
 
         Rigidbody _body;
@@ -37,8 +36,7 @@ namespace CoinRush
 
             _heading = RandomHeading();
 
-            // Staggered rather than synchronised: hazards launched on the same frame would otherwise
-            // all turn on the same frame forever, which reads as choreography, not chaos.
+            // Randomise the first turn so hazards spawned on the same frame do not all turn together.
             _nextTurnAt = Time.time + Random.Range(0f, _turnInterval);
         }
 
@@ -60,17 +58,16 @@ namespace CoinRush
             var position = transform.position;
             var next = position + _heading * (_speed * Time.deltaTime);
 
-            // The boundary is a circle rather than the square the walls actually make. A hazard that
-            // clipped a corner would sit half inside a wall, and the ball would lose a life to
-            // something it cannot see.
+            // The boundary is a circle inside the square walls, so a hazard never ends up partly
+            // inside a wall where the player cannot see it.
             var planar = new Vector2(next.x, next.z);
             if (planar.sqrMagnitude > _boundRadius * _boundRadius)
             {
                 var inward = -planar.normalized;
                 _heading = Vector3.Reflect(_heading, new Vector3(inward.x, 0f, inward.y)).normalized;
 
-                // Pinned back onto the circle in the same frame it crossed. Reflecting alone can
-                // leave a hazard outside on a shallow angle, where it bounces every frame and stalls.
+                // Move it back onto the circle in the same frame. Reflecting alone can leave a hazard
+                // outside at a shallow angle, where it bounces every frame and gets stuck.
                 planar = planar.normalized * _boundRadius;
                 next = new Vector3(planar.x, position.y, planar.y);
             }

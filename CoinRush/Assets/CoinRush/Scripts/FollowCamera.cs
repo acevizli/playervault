@@ -3,11 +3,11 @@ using UnityEngine;
 namespace CoinRush
 {
     /// <summary>
-    /// Trails the ball at a fixed offset without ever rotating.
+    /// Follows the ball at a fixed offset without rotating.
     ///
-    /// The rotation is deliberately left alone. <see cref="BallController"/> steers relative to this
-    /// camera, so a camera that swung around to look at the ball would rotate the control scheme under
-    /// the player's thumb mid-roll. A fixed angle keeps "up the screen" meaning one thing forever.
+    /// <see cref="BallController"/> steers relative to this camera, so rotating the camera would
+    /// also rotate the controls while the player is steering. With a fixed angle, up on the screen
+    /// always means the same direction.
     /// </summary>
     public sealed class FollowCamera : MonoBehaviour
     {
@@ -23,8 +23,8 @@ namespace CoinRush
 
         void LateUpdate()
         {
-            // LateUpdate, because the ball moves during FixedUpdate/Update. Following in Update would
-            // chase last frame's position and the ball would visibly jitter against the background.
+            // LateUpdate runs after the ball has moved. Following in Update would use last frame's
+            // position and make the ball jitter.
             if (target == null)
             {
                 return;

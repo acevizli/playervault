@@ -4,8 +4,8 @@ using UnityEngine;
 namespace CoinRush
 {
     /// <summary>
-    /// A single pickup. Knows nothing about scores or the SDK — it only announces that it was touched
-    /// and takes itself off the board. Whoever owns the level's state decides what that is worth.
+    /// A single pickup. It does not know about scores or the SDK. It raises an event when touched
+    /// and hides itself; the level decides what the pickup is worth.
     /// </summary>
     public sealed class Coin : MonoBehaviour
     {
@@ -23,8 +23,8 @@ namespace CoinRush
 
         void OnTriggerEnter(Collider other)
         {
-            // Physics can report the same overlap on consecutive frames while the object is being torn
-            // down, so the flag — not the deactivation — is what guarantees "collected" fires once.
+            // Physics can report the same overlap on several frames while the object is being
+            // removed, so the flag makes sure Collected fires only once.
             if (_taken || other.GetComponentInParent<BallController>() == null)
             {
                 return;

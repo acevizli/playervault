@@ -6,17 +6,15 @@ namespace CoinRush
     /// <summary>
     /// Turns a press-and-drag gesture into a steering vector in the range [-1, 1] on both axes.
     ///
-    /// This is a floating virtual joystick: wherever the finger lands becomes the centre, and how far
-    /// it travels from there is how hard the ball is pushed. Nothing is drawn — the anchor is wherever
-    /// you pressed, which is what mobile players expect from a thumb they cannot see under.
+    /// A floating virtual joystick: the point where the finger first touches is the centre, and
+    /// the distance dragged from there sets how hard the ball is pushed. Nothing is drawn.
     ///
-    /// It reads <see cref="Pointer"/> rather than <see cref="Touchscreen"/> on purpose. Pointer is the
-    /// Input System's abstract base for mouse, pen and touch alike, so the mouse in the Editor drives
-    /// exactly the same code path the finger drives on a phone. No device required to iterate.
-    /// Keyboard is polled too, as a convenience for testing in the Editor.
+    /// Reads <see cref="Pointer"/> instead of <see cref="Touchscreen"/>. Pointer covers mouse, pen
+    /// and touch, so the mouse in the Editor uses the same code path as a finger on a phone. The
+    /// keyboard is also read, for testing in the Editor.
     ///
-    /// Plain C# class, not a MonoBehaviour: it holds gesture state but needs no Unity lifecycle of its
-    /// own, and keeping it off the GameObject means one less component to wire up in the Inspector.
+    /// A plain C# class instead of a MonoBehaviour, since it needs no Unity lifecycle and this
+    /// avoids another component to set up in the Inspector.
     /// </summary>
     public sealed class SteeringInput
     {
@@ -26,8 +24,8 @@ namespace CoinRush
         bool _dragging;
 
         /// <param name="dragRadiusPixels">
-        /// How far the finger must travel from the anchor for full tilt. Scaled off screen height so
-        /// the gesture feels the same on a 720p phone and a tablet.
+        /// How far the finger must move from the start point for full speed. Scaled by screen height
+        /// so the gesture feels the same on a small phone and a tablet.
         /// </param>
         public SteeringInput(float dragRadiusPixels)
         {
@@ -40,7 +38,7 @@ namespace CoinRush
             var keyboard = ReadKeyboard();
             if (keyboard.sqrMagnitude > 0.001f)
             {
-                // A key is down, so the player is clearly at a desk. Let it win over a stale drag.
+                // A key is pressed, so keyboard input takes priority over any drag.
                 _dragging = false;
                 return keyboard;
             }
@@ -66,7 +64,7 @@ namespace CoinRush
 
             if (!_dragging)
             {
-                // First frame of the press: this is where the joystick lives until the finger lifts.
+                // First frame of the press: this point is the joystick centre until the finger lifts.
                 _anchor = position;
                 _dragging = true;
                 return Vector2.zero;

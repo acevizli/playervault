@@ -8,16 +8,12 @@ using UnityEngine.UI;
 namespace CoinRush
 {
     /// <summary>
-    /// The heads-up display: balances, the level being played, the state of the reward claim, the
-    /// level select — which doubles as the shop — and an inspector panel showing the vault's whole
-    /// contents.
+    /// The HUD: balances, the current level, the reward claim status, the level select (which is
+    /// also the shop) and a panel that shows everything in the vault.
     ///
-    /// The canvas is built in <see cref="Awake"/> rather than authored in the scene. A dozen widgets
-    /// do not justify hand-placing a Canvas, a scaler and a rect transform each, and every one of
-    /// those is a place to mis-set a value that only misbehaves on an aspect ratio nobody tested. It
-    /// also uses the built-in legacy font: TextMeshPro refuses to render a character until its
-    /// essential resources are imported, which puts a dialog box between a fresh clone and a running
-    /// game.
+    /// The canvas is built in code in <see cref="Awake"/> instead of in the scene, which avoids
+    /// setting up each widget by hand. It uses the built-in legacy font because TextMeshPro shows
+    /// an import dialog on a fresh clone before it can render text.
     /// </summary>
     [RequireComponent(typeof(LevelController))]
     public sealed class HudView : MonoBehaviour
@@ -27,14 +23,24 @@ namespace CoinRush
         const float NoticeSeconds = 2.5f;
 
         /// <summary>
-        /// How long a settled reward stays on screen. Short on purpose: it is an event, not a
-        /// status, and the balance it moved is already on the top bar. Pending and failed claims
-        /// are not put on this timer — those are the ones worth reading.
+        /// How long a granted reward message stays on screen. Kept short because the new balance
+        /// is already on the top bar. Pending and failed claims stay until they change.
         /// </summary>
         const float ClaimSeconds = 1f;
         const float PanelRefreshSeconds = 0.5f;
         const float RowHeight = 150f;
         const float RowPitch = 174f;
+
+        /// <summary>
+        /// How far a full-bleed backdrop reaches past the safe area, in reference units.
+        /// </summary>
+        /// <remarks>
+        /// Widgets sit inside the safe area so nothing is hidden behind a notch, but the backgrounds
+        /// behind them must reach the edge of the screen. A child RectTransform can extend past its
+        /// parent (uGUI only clips under a Mask), so the backgrounds overshoot by a large margin
+        /// instead of measuring the inset. 1000 units is larger than any cutout.
+        /// </remarks>
+        const float Bleed = 1000f;
 
         static readonly Color Ink = new Color(0.96f, 0.97f, 1f);
         static readonly Color Dim = new Color(0.62f, 0.68f, 0.78f);
@@ -52,11 +58,10 @@ namespace CoinRush
         /// A button and the label on it.
         /// </summary>
         /// <remarks>
-        /// The fill colour is set through <see cref="Selectable.colors"/> rather than on the Image.
-        /// Selectable owns its target graphic: every state change cross-fades the canvas renderer
-        /// back to whichever ColorBlock entry matches the current state, so a colour written
-        /// straight to the Image is overwritten a frame later. The default block is white for every
-        /// state, which is why these buttons flashed white and swallowed their own white labels.
+        /// The fill colour is set through <see cref="Selectable.colors"/>, not on the Image.
+        /// Selectable tints its target graphic on every state change, so a colour set directly on
+        /// the Image is overwritten. The default ColorBlock is white, which made the buttons white
+        /// and hid their white labels.
         /// </remarks>
         sealed class ButtonView
         {
@@ -78,14 +83,14 @@ namespace CoinRush
                 colors.highlightedColor = fill;
                 colors.selectedColor = fill;
                 colors.pressedColor = new Color(fill.r * 0.72f, fill.g * 0.72f, fill.b * 0.72f, fill.a);
-                colors.disabledColor = fill;   // The caller already passed the colour for this state.
+                colors.disabledColor = fill;   // the caller passes the colour for the current state
                 colors.colorMultiplier = 1f;
                 colors.fadeDuration = 0.06f;
                 Button.colors = colors;
             }
         }
 
-        /// <summary>One line of the level select: the button, its name, and its right-hand state.</summary>
+        /// <summary>One row of the level select: the button, the level name and its status.</summary>
         sealed class LevelRow
         {
             public ButtonView View;
@@ -131,6 +136,7 @@ namespace CoinRush
             _level.ClaimChanged += OnClaimChanged;
             _level.LevelChanged += OnLevelChanged;
             _level.PendingClaimsChanged += OnPendingClaimsChanged;
+            _level.RetryOfferChanged += OnRetryOfferChanged;
             _level.UnlocksChanged += RefreshMenu;
             _level.Notice += OnNotice;
         }
@@ -143,6 +149,7 @@ namespace CoinRush
             _level.ClaimChanged -= OnClaimChanged;
             _level.LevelChanged -= OnLevelChanged;
             _level.PendingClaimsChanged -= OnPendingClaimsChanged;
+            _level.RetryOfferChanged -= OnRetryOfferChanged;
             _level.UnlocksChanged -= RefreshMenu;
             _level.Notice -= OnNotice;
         }
@@ -173,16 +180,14 @@ namespace CoinRush
         {
             _coins.text = $"COINS  {value}";
 
-            // The menu is also the shop, so every coin picked up can flip a row from unaffordable
-            // to buyable. Asking the vault again is cheaper than tracking which rows might have
-            // changed, and it keeps CanSpend the single authority on what the player can afford.
+            // The menu is also the shop, so any coin change can make a level affordable. Redraw
+            // every row and let CanSpend decide.
             RefreshMenu();
         }
 
         /// <summary>
-        /// Renders the ceiling alongside the balance. The maximum is a configured fact the vault
-        /// already knows, and a HUD that prints a bare "3" makes the cap invisible until the moment
-        /// it silently swallows a grant.
+        /// Shows the maximum next to the balance, so the player can see when a grant will be
+        /// clamped.
         /// </summary>
         void OnLivesChanged(long value)
         {
@@ -197,24 +202,48 @@ namespace CoinRush
                 : $"LEVEL {_level.CurrentIndex + 1}/{_level.LevelCount}  {level.name.ToUpperInvariant()}";
         }
 
+        void OnPendingClaimsChanged(int count) => RefreshPendingRow();
+
+        void OnRetryOfferChanged(bool offered) => RefreshPendingRow();
+
         /// <summary>
-        /// The count of claims the vault has not settled yet, shown permanently rather than only on
-        /// the screen that produced them. It is the visible half of the guarantee the case asks for:
-        /// the unlock button next to it stays live while this is non-zero, because a claim in flight
-        /// reserves nothing.
+        /// The number of pending claims, always visible. The unlock button stays usable while this
+        /// is above zero, because pending claims do not reserve any balance.
         /// </summary>
-        void OnPendingClaimsChanged(int count)
+        /// <remarks>
+        /// While a retry is offered, the line is amber with the button beside it. After a retry that
+        /// changed nothing, the button is removed and the line turns grey. The game does not wait on
+        /// either, because the reward is already saved.
+        /// </remarks>
+        void RefreshPendingRow()
         {
+            var count = _level.PendingClaimCount;
+
             if (count == 0)
             {
                 _pending.text = string.Empty;
-                _retry.Button.gameObject.SetActive(false);
+                SetRetryVisible(false);
                 return;
             }
 
             _pending.text = count == 1 ? "1 REWARD PENDING" : $"{count} REWARDS PENDING";
-            _pending.color = Warn;
-            _retry.Button.gameObject.SetActive(true);
+            _pending.color = _level.RetryOffered ? Warn : Dim;
+            SetRetryVisible(_level.RetryOffered);
+        }
+
+        /// <summary>
+        /// Shows or hides the retry button. When it is hidden, VAULT takes the full bottom row so
+        /// there is no empty gap.
+        /// </summary>
+        void SetRetryVisible(bool visible)
+        {
+            _retry.Button.gameObject.SetActive(visible);
+
+            var rect = _vaultToggle.Fill.rectTransform;
+            rect.anchorMin = new Vector2(visible ? 0.5f : 0f, 0f);
+            rect.anchorMax = new Vector2(1f, 0f);
+            rect.offsetMin = new Vector2(visible ? 12f : 72f, 140f);
+            rect.offsetMax = new Vector2(-72f, 270f);
         }
 
         void OnPhaseChanged(LevelPhase phase)
@@ -238,8 +267,7 @@ namespace CoinRush
                     break;
             }
 
-            // A run starting, by either route, wipes the previous run's reward line. Nothing about
-            // the last clear is worth saying while the ball is rolling again.
+            // Clear the previous run's reward line when a new run starts.
             if (phase == LevelPhase.Menu || phase == LevelPhase.Playing)
             {
                 ClearClaim();
@@ -253,18 +281,14 @@ namespace CoinRush
             _menuPanel.SetActive(phase == LevelPhase.Menu);
             if (phase == LevelPhase.Menu) RefreshMenu();
 
-            // The replay catcher and the way back to the menu are only live between runs. While the
-            // ball is rolling they would sit in front of nothing that matters, but leaving them
-            // enabled is one more surface to reason about.
+            // The replay button and the menu button are only active between runs.
             var between = phase == LevelPhase.Completed || phase == LevelPhase.GameOver;
             _tapCatcher.gameObject.SetActive(between);
             _levelsButton.Button.gameObject.SetActive(between);
         }
 
         /// <summary>
-        /// Renders the claim's own account of itself. Every branch here is a state the case asks the
-        /// SDK to expose, and showing them verbatim is how the integration stays honest — a HUD that
-        /// only knew "granted" would quietly hide the pending and clamped cases.
+        /// Shows the claim status, including the pending, clamped and failed cases.
         /// </summary>
         void OnClaimChanged(ClaimStatus status, ClaimRecord record)
         {
@@ -274,11 +298,9 @@ namespace CoinRush
                 return;
             }
 
-            // The status comes from the claim's outcome, not from the record. They differ on a
-            // replay — the outcome is AlreadyGranted while the record it wraps still says Granted,
-            // because that is the truth about the first time. Switching on the record would print
-            // "+100 COINS" every single clear, which is the SDK's guarantee being contradicted by
-            // the game that depends on it.
+            // Use the result status, not the record's. On a repeat clear the result is
+            // AlreadyGranted while the record still says Granted, so switching on the record would
+            // show "+100 COINS" every time.
             _claimUntil = status == ClaimStatus.Granted || status == ClaimStatus.AlreadyGranted
                 ? Time.unscaledTime + ClaimSeconds
                 : 0f;
@@ -298,16 +320,15 @@ namespace CoinRush
                     break;
 
                 case ClaimStatus.Pending:
-                    // Pending is not an error. The claim is durable, and the vault replays it on the
-                    // next launch, so the player is told to expect it rather than to retry.
+                    // Pending is not an error. The claim is saved and will be retried on the next
+                    // launch.
                     _claim.text = $"REWARD PENDING - WILL RETRY ({record.Attempts} ATTEMPTS)";
                     _claim.color = Warn;
                     break;
 
                 case ClaimStatus.Failed:
-                    // The failures are told apart rather than printed as one word. "The network was
-                    // down" and "the server said no" are the same colour of red to a HUD that only
-                    // prints record.Failure, and they are completely different news to a player.
+                    // Show which failure it was, so "network down" and "server refused" read
+                    // differently.
                     _claim.text = DescribeFailure(record.Failure);
                     _claim.color = Bad;
                     break;
@@ -342,10 +363,8 @@ namespace CoinRush
         // ------------------------------------------------------------------ level select
 
         /// <summary>
-        /// Redraws every row of the level select. Each row asks the vault what it is: owned levels
-        /// play, locked ones show their price, and <see cref="Vault.CanSpend"/> — not a comparison
-        /// written here — decides which of those prices is live. Rewriting all five is cheaper than
-        /// working out which one changed, and it means there is one code path producing the state.
+        /// Redraws every row of the level select. Owned levels can be played, locked ones show
+        /// their price, and <see cref="Vault.CanSpend"/> decides which prices are affordable.
         /// </summary>
         void RefreshMenu()
         {
@@ -374,9 +393,8 @@ namespace CoinRush
         }
 
         /// <summary>
-        /// One tap, two meanings — but never both. A locked row buys; an owned row plays. Buying
-        /// does start the level it just bought, which is the only place the two meet, and that is a
-        /// deliberate convenience rather than a tap doing something the label did not promise.
+        /// A tap on a locked row buys the level; a tap on an owned row plays it. After a purchase
+        /// the new level starts.
         /// </summary>
         void OnLevelRowClicked(int index)
         {
@@ -399,9 +417,8 @@ namespace CoinRush
         }
 
         /// <summary>
-        /// Dumps everything the vault holds. This is the screen that makes the SDK's state
-        /// inspectable without a debugger: every declared balance with its ceiling, the player id the
-        /// save file is keyed by, and every claim that has not settled, with its attempt count.
+        /// Shows the vault contents without a debugger: the player id, every balance with its
+        /// maximum, and every pending claim with its attempt count.
         /// </summary>
         void RefreshVaultPanel()
         {
@@ -431,9 +448,12 @@ namespace CoinRush
 
             foreach (var record in pending)
             {
+                // Describe() gives more detail than the status alone, for example
+                // "pending after 3 attempt(s) (Network), HTTP 429: Too Many Requests".
                 builder.Append("  ").Append(record.RewardId)
                     .Append("  +").Append(record.AmountRequested).Append(' ').Append(record.Resource)
-                    .Append("  ").Append(record.Attempts).AppendLine(" ATTEMPTS");
+                    .AppendLine()
+                    .Append("     ").AppendLine(record.Describe().ToUpperInvariant());
             }
 
             builder.AppendLine();
@@ -441,7 +461,7 @@ namespace CoinRush
 
             for (var i = 0; i < _level.LevelCount; i++)
             {
-                var record = vault.GetClaim(LevelController.RewardIdFor(i));
+                var record = vault.GetClaim(_level.RewardIdFor(i));
                 builder.Append("  ").Append(i + 1).Append("  ")
                     .Append(_level.IsUnlocked(i) ? "OWNED " : "LOCKED")
                     .Append("  REWARD ")
@@ -454,9 +474,8 @@ namespace CoinRush
         // ------------------------------------------------------------------ construction
 
         /// <summary>
-        /// uGUI buttons do nothing without an EventSystem, and this scene has no reason to carry one
-        /// in its hierarchy when the HUD that needs it builds itself. The input module assigns its
-        /// own default actions on enable, so nothing here has to author an input asset.
+        /// uGUI buttons need an EventSystem. The HUD creates one because it builds itself in code.
+        /// The input module sets up its default actions when enabled, so no input asset is needed.
         /// </summary>
         static void EnsureEventSystem()
         {
@@ -480,18 +499,21 @@ namespace CoinRush
             scaler.referenceResolution = new Vector2(ReferenceWidth, ReferenceHeight);
             scaler.matchWidthOrHeight = 0.5f;
 
-            var root = canvasObject.transform;
+            var screen = canvasObject.transform;
 
-            // Built first, so it sits at the back of the sibling order and every other widget wins
-            // the raycast against it. This is the whole reason the replay is a uGUI button rather
-            // than a pointer read: sorting, not frame ordering, decides who owns the tap.
-            _tapCatcher = CreateTapCatcher(root, _level.RequestReplay);
+            // Built first so it is behind every other widget and they get taps first. It is parented
+            // to the canvas, not the safe area, so taps next to the notch still count.
+            _tapCatcher = CreateTapCatcher(screen, _level.RequestReplay);
 
-            // A slab behind the top rows. Flat white text over a bright arena floor is unreadable at
-            // exactly the moment the player is looking at the arena instead of the numbers.
+            // Text and buttons are placed inside the safe area, so a notch or home indicator does not
+            // cover them. The offsets below are relative to the safe area.
+            var root = CreateSafeArea(screen);
+
+            // A dark background behind the top rows, because white text is hard to read over the
+            // bright floor. It extends past the safe area up to the top of the screen.
             CreatePanel(root, "TopBar", Panel,
                 new Vector2(0f, 1f), new Vector2(1f, 1f),
-                new Vector2(0f, -280f), new Vector2(0f, 0f));
+                new Vector2(-Bleed, -280f), new Vector2(Bleed, Bleed));
 
             _coins = CreateLabel(root, "Coins", TextAnchor.UpperLeft,
                 new Vector2(0f, 1f), new Vector2(0.5f, 1f),
@@ -530,7 +552,6 @@ namespace CoinRush
                 new Vector2(0f, 0f), new Vector2(0.5f, 0f),
                 new Vector2(72f, 140f), new Vector2(-12f, 270f), 34);
             _retry.Button.onClick.AddListener(_level.RetryPendingClaims);
-            _retry.Button.gameObject.SetActive(false);
 
             _vaultToggle = CreateButton(root, "VaultToggle", "VAULT", new Color(0.18f, 0.22f, 0.3f),
                 new Vector2(0.5f, 0f), new Vector2(1f, 0f),
@@ -540,8 +561,7 @@ namespace CoinRush
             BuildMenu(root);
             BuildVaultPanel(root);
 
-            // The vault opens asynchronously, so the first thing on screen is a statement that
-            // something is happening rather than an empty arena the player cannot steer.
+            // The vault opens asynchronously, so show a loading message until it is ready.
             _banner.text = "OPENING VAULT";
             _claim.text = string.Empty;
             _notice.text = string.Empty;
@@ -549,12 +569,12 @@ namespace CoinRush
             _levelLabel.text = string.Empty;
             _levelsButton.Button.gameObject.SetActive(false);
             _tapCatcher.gameObject.SetActive(false);
+            SetRetryVisible(false);
         }
 
         /// <summary>
-        /// The level select. It deliberately stops short of the top bar and the bottom button row
-        /// rather than covering the screen: coins stay readable while shopping, and the notice line
-        /// that says why a purchase was refused has to be visible at the moment it is refused.
+        /// The level select. It leaves the top bar and bottom buttons visible, so the coin count and
+        /// the purchase messages can be seen while shopping.
         /// </summary>
         void BuildMenu(Transform root)
         {
@@ -585,15 +605,14 @@ namespace CoinRush
                 new Vector2(0f, 1f), new Vector2(1f, 1f),
                 new Vector2(48f, -(top + RowHeight)), new Vector2(-48f, -top), 42);
 
-            // The shared label is pushed left and given room on the right for the state, so a long
-            // level name cannot run underneath its own price.
+            // Leave room on the right for the status so a long level name does not overlap the price.
             view.Label.alignment = TextAnchor.MiddleLeft;
             view.Label.rectTransform.offsetMax = new Vector2(-300f, -8f);
 
             var state = CreateLabel(view.Button.transform, "State", TextAnchor.MiddleRight,
                 Vector2.zero, Vector2.one, new Vector2(24f, 8f), new Vector2(-32f, -8f), 36, Ink);
 
-            // Captured once: the loop variable would otherwise be shared by every listener.
+            // Copy the loop variable so each listener gets its own value.
             var captured = index;
             view.Button.onClick.AddListener(() => OnLevelRowClicked(captured));
 
@@ -602,23 +621,29 @@ namespace CoinRush
 
         void BuildVaultPanel(Transform root)
         {
-            // Built last so it sits on top of everything else in sibling order, and opaque enough to
-            // swallow taps that would otherwise reach the replay handler behind it.
-            var panel = CreatePanel(root, "VaultPanel", Scrim,
+            // Built last so it is on top. The panel is an empty frame on the safe area and only its
+            // background extends past it, so the title, text and close button stay on screen.
+            var panel = CreateGroup(root, "VaultPanel",
                 new Vector2(0f, 0f), new Vector2(1f, 1f), Vector2.zero, Vector2.zero);
 
-            panel.raycastTarget = true;
             _vaultPanel = panel.gameObject;
 
-            CreateLabel(panel.transform, "Title", TextAnchor.UpperCenter,
+            // Blocks taps from reaching the replay button behind it.
+            var backdrop = CreatePanel(panel, "Backdrop", Scrim,
+                new Vector2(0f, 0f), new Vector2(1f, 1f),
+                new Vector2(-Bleed, -Bleed), new Vector2(Bleed, Bleed));
+
+            backdrop.raycastTarget = true;
+
+            CreateLabel(panel, "Title", TextAnchor.UpperCenter,
                 new Vector2(0f, 1f), new Vector2(1f, 1f),
                 new Vector2(48f, -190f), new Vector2(-48f, -90f), 56, Ink).text = "VAULT";
 
-            _vaultText = CreateLabel(panel.transform, "Contents", TextAnchor.UpperLeft,
+            _vaultText = CreateLabel(panel, "Contents", TextAnchor.UpperLeft,
                 new Vector2(0f, 0f), new Vector2(1f, 1f),
                 new Vector2(72f, 320f), new Vector2(-72f, -220f), 34, Ink);
 
-            var close = CreateButton(panel.transform, "Close", "CLOSE", new Color(0.18f, 0.22f, 0.3f),
+            var close = CreateButton(panel, "Close", "CLOSE", new Color(0.18f, 0.22f, 0.3f),
                 new Vector2(0f, 0f), new Vector2(1f, 0f),
                 new Vector2(72f, 140f), new Vector2(-72f, 270f), 40);
             close.Button.onClick.AddListener(ToggleVaultPanel);
@@ -627,9 +652,8 @@ namespace CoinRush
         }
 
         /// <summary>
-        /// A transparent, full-screen button. A fully transparent Image still takes raycasts — uGUI
-        /// only alpha-tests when a sprite and a hit threshold are set — so nothing has to be visible
-        /// for the tap to land.
+        /// A transparent full-screen button. A transparent Image still receives raycasts (uGUI only
+        /// alpha-tests with a sprite and a hit threshold), so the button works while invisible.
         /// </summary>
         static Button CreateTapCatcher(Transform parent, UnityEngine.Events.UnityAction onClick)
         {
@@ -640,10 +664,39 @@ namespace CoinRush
 
             var button = image.gameObject.AddComponent<Button>();
             button.targetGraphic = image;
-            button.transition = Selectable.Transition.None;   // No tint: the catcher must stay invisible.
+            button.transition = Selectable.Transition.None;   // no tint, so it stays invisible
             button.onClick.AddListener(onClick);
 
             return button;
+        }
+
+        /// <summary>
+        /// An invisible frame that follows <see cref="Screen.safeArea"/>. Children are inset
+        /// automatically.
+        /// </summary>
+        static Transform CreateSafeArea(Transform parent)
+        {
+            var safe = CreateGroup(parent, "SafeArea",
+                Vector2.zero, Vector2.one, Vector2.zero, Vector2.zero);
+
+            safe.gameObject.AddComponent<SafeArea>();
+            return safe;
+        }
+
+        /// <summary>An empty RectTransform used as a parent. Draws nothing.</summary>
+        static Transform CreateGroup(Transform parent, string name,
+            Vector2 anchorMin, Vector2 anchorMax, Vector2 offsetMin, Vector2 offsetMax)
+        {
+            var group = new GameObject(name, typeof(RectTransform));
+            group.transform.SetParent(parent, worldPositionStays: false);
+
+            var rect = group.GetComponent<RectTransform>();
+            rect.anchorMin = anchorMin;
+            rect.anchorMax = anchorMax;
+            rect.offsetMin = offsetMin;
+            rect.offsetMax = offsetMax;
+
+            return group.transform;
         }
 
         static Image CreatePanel(Transform parent, string name, Color colour,
@@ -668,8 +721,7 @@ namespace CoinRush
         static ButtonView CreateButton(Transform parent, string name, string label, Color fill,
             Vector2 anchorMin, Vector2 anchorMax, Vector2 offsetMin, Vector2 offsetMax, int fontSize)
         {
-            // White, deliberately: the ColorBlock tint multiplies the Image's own colour, so the
-            // Image has to be the identity or every state comes out doubled.
+            // White, because the ColorBlock tint is multiplied by the Image colour.
             var image = CreatePanel(parent, name, Color.white, anchorMin, anchorMax, offsetMin, offsetMax);
             image.raycastTarget = true;
 
@@ -680,8 +732,7 @@ namespace CoinRush
                 Vector2.zero, Vector2.one, new Vector2(24f, 8f), new Vector2(-24f, -8f),
                 fontSize, Color.white);
 
-            // Every button that is not refreshed from state — LEVELS, VAULT, RETRY, CLOSE — got its
-            // caption from here and nowhere else, so dropping this line left them blank.
+            // LEVELS, VAULT, RETRY and CLOSE only get their captions here.
             text.text = label;
 
             var view = new ButtonView { Button = button, Fill = image, Label = text };

@@ -4,18 +4,27 @@ using UnityEngine;
 namespace CoinRush
 {
     /// <summary>
-    /// One level's shape and price, authored in the Inspector.
+    /// One level's layout and price, set in the Inspector.
     ///
-    /// Levels are data rather than scenes. Three scenes that differ only in how many coins sit on a
-    /// ring would be three places to fix the same bug, and loading one costs a frame hitch that a
-    /// ring rebuild does not. The trade is the same one <see cref="ArenaBuilder"/> already makes:
-    /// no hand-placed geometry, so no art direction per level.
+    /// Levels are data instead of scenes. Scenes that differ only in coin count would mean fixing
+    /// the same bug in several places, and loading a scene causes a hitch that rebuilding the ring
+    /// does not. As with <see cref="ArenaBuilder"/>, nothing is placed by hand.
     /// </summary>
     [Serializable]
     public sealed class LevelDefinition
     {
-        [Tooltip("Shown on the HUD. Flavour only — the reward id is derived from the level's position.")]
+        [Tooltip("Shown on the HUD. Display only; progress is saved under the ids below.")]
         public string name = "LEVEL";
+
+        [Header("Identity")]
+        [Tooltip("Fixed id for this level's one-time first-clear reward. Set by hand so that reordering " +
+                 "or inserting levels cannot move a reward to a different level. If empty, the level's " +
+                 "position is used, which breaks if the list order changes.")]
+        public string rewardId;
+
+        [Tooltip("Fixed resource key that records owning this level. Must also be declared on the " +
+                 "VaultBehaviour with Initial 0 and Max 1. If empty, the level's position is used.")]
+        public string unlockKey;
 
         [Header("Layout")]
         public int coinCount = 8;

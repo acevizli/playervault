@@ -4,8 +4,8 @@ using UnityEngine;
 namespace CoinRush
 {
     /// <summary>
-    /// A spinning block that costs the player a life. Like <see cref="Coin"/> it holds no game state;
-    /// it reports contact and lets the level decide the consequence.
+    /// A spinning block that costs the player a life. Like <see cref="Coin"/>, it holds no game
+    /// state; it reports contact and the level decides what happens.
     /// </summary>
     public sealed class Hazard : MonoBehaviour
     {
@@ -26,9 +26,9 @@ namespace CoinRush
 
         void OnTriggerEnter(Collider other)
         {
-            // The ball is teleported home on contact, so it should not still be overlapping — but a
-            // respawn point inside a hazard, or two hazards in a corner, would otherwise drain every
-            // life in a handful of frames. The cooldown makes that impossible rather than unlikely.
+            // The ball is moved back to the start on contact, so it should not still overlap. The
+            // cooldown covers cases like a respawn point inside a hazard, which would otherwise
+            // take every life in a few frames.
             if (Time.time < _readyAt || other.GetComponentInParent<BallController>() == null)
             {
                 return;

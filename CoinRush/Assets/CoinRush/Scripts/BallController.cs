@@ -3,8 +3,8 @@ using UnityEngine;
 namespace CoinRush
 {
     /// <summary>
-    /// Drives the player ball by pushing its Rigidbody around. The ball is never teleported: everything
-    /// is force, so it rolls, bounces off walls and carries momentum for free from the physics engine.
+    /// Moves the player ball by applying forces to its Rigidbody, so the physics engine handles
+    /// rolling, bouncing and momentum.
     /// </summary>
     [RequireComponent(typeof(Rigidbody))]
     public sealed class BallController : MonoBehaviour
@@ -29,12 +29,12 @@ namespace CoinRush
         Vector3 _spawnPoint;
         Vector2 _steering;
 
-        /// <summary>Raised when the ball falls out of the arena. Lives hook onto this in a later ticket.</summary>
+        /// <summary>Raised when the ball falls out of the arena.</summary>
         public event System.Action Fell;
 
         void Awake()
         {
-            // Awake, not Start: caching references happens before anything else can ask us to move.
+            // Cache references in Awake so they are ready before anything else calls this component.
             _body = GetComponent<Rigidbody>();
             _spawnPoint = transform.position;
 
@@ -49,16 +49,14 @@ namespace CoinRush
 
         void Update()
         {
-            // Input is sampled in Update because Update runs once per rendered frame — the same rate the
-            // player's finger is actually moving at. FixedUpdate can run zero or several times per frame,
-            // so sampling there would drop or double-count gestures.
+            // Read input in Update, which runs once per frame. FixedUpdate can run zero or several
+            // times per frame, so reading input there would drop or repeat gestures.
             _steering = _input.Read();
         }
 
         void FixedUpdate()
         {
-            // Forces are applied in FixedUpdate because that is the physics clock. Applying force in
-            // Update would make the ball's acceleration depend on frame rate.
+            // Apply forces in FixedUpdate so acceleration does not depend on frame rate.
             var direction = ToWorldDirection(_steering);
             if (direction.sqrMagnitude > 0.0001f)
             {
@@ -89,8 +87,8 @@ namespace CoinRush
                 return new Vector3(steering.x, 0f, steering.y);
             }
 
-            // Flatten the camera's axes onto the ground plane. Without this, a camera angled downwards
-            // would push the ball into the floor whenever the player swiped "forward".
+            // Flatten the camera axes onto the ground. Otherwise a downward-angled camera would push
+            // the ball into the floor when the player steers forward.
             var forward = Vector3.ProjectOnPlane(steeringReference.forward, Vector3.up).normalized;
             var right = Vector3.ProjectOnPlane(steeringReference.right, Vector3.up).normalized;
 
@@ -99,8 +97,7 @@ namespace CoinRush
 
         void ClampHorizontalSpeed()
         {
-            // Only the horizontal component is capped. Clamping the full velocity would also throttle
-            // gravity, and the ball would float down instead of dropping.
+            // Cap only horizontal speed. Capping the full velocity would also slow the fall.
             var velocity = _body.linearVelocity;
             var horizontal = new Vector3(velocity.x, 0f, velocity.z);
 
