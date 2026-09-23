@@ -169,6 +169,79 @@ namespace PlayerVault.Tests
         }
     }
 
+    /// <summary>A key store in memory, standing in for the Keychain or Keystore.</summary>
+    internal sealed class InMemoryKeyStore : IVaultKeyStore
+    {
+        readonly object _sync = new object();
+        readonly Dictionary<string, byte[]> _keys = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+        readonly Dictionary<string, long> _counters = new Dictionary<string, long>(StringComparer.Ordinal);
+
+        /// <summary>Every call throws while this is set, like a locked Keychain.</summary>
+        public bool Fail;
+
+        /// <summary>Counter writes are dropped while this is set, like the app stopping right after a save.</summary>
+        public bool DropCounterWrites;
+
+        public long Counter(string playerId)
+        {
+            lock (_sync) return _counters.TryGetValue(playerId, out var counter) ? counter : 0;
+        }
+
+        public bool HasKey(string playerId)
+        {
+            lock (_sync) return _keys.ContainsKey(playerId);
+        }
+
+        public Task<byte[]> GetOrCreateKeyAsync(string playerId, CancellationToken cancellationToken = default)
+        {
+            ThrowIfFailing();
+            lock (_sync)
+            {
+                if (!_keys.TryGetValue(playerId, out var key))
+                {
+                    key = new byte[32];
+                    new System.Random().NextBytes(key);
+                    _keys[playerId] = key;
+                }
+
+                return Task.FromResult((byte[])key.Clone());
+            }
+        }
+
+        public Task<long> ReadCounterAsync(string playerId, CancellationToken cancellationToken = default)
+        {
+            ThrowIfFailing();
+            return Task.FromResult(Counter(playerId));
+        }
+
+        public Task WriteCounterAsync(string playerId, long counter, CancellationToken cancellationToken = default)
+        {
+            ThrowIfFailing();
+            lock (_sync)
+            {
+                if (!DropCounterWrites && counter > Counter(playerId)) _counters[playerId] = counter;
+            }
+
+            return Task.CompletedTask;
+        }
+
+        public Task DeleteAsync(string playerId, CancellationToken cancellationToken = default)
+        {
+            lock (_sync)
+            {
+                _keys.Remove(playerId);
+                _counters.Remove(playerId);
+            }
+
+            return Task.CompletedTask;
+        }
+
+        void ThrowIfFailing()
+        {
+            if (Fail) throw new InvalidOperationException("the key store is unavailable");
+        }
+    }
+
     /// <summary>
     /// A clock that does not wait, so retry delays cost no time in tests.
     /// </summary>

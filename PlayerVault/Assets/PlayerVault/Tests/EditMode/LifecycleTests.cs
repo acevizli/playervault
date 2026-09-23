@@ -110,7 +110,7 @@ namespace PlayerVault.Tests
             Run(vault.ClaimAsync("level-1", "coins", 50));
             Run(vault.CloseAsync());
 
-            Run(Vault.DeleteSaveAsync(Player, storage));
+            Run(Vault.DeleteSaveAsync(Player, storage, KeyStoreFor(storage)));
 
             using var fresh = Open(Config(storage: storage));
             Assert.AreEqual(100, fresh.GetBalance("coins"));
@@ -125,7 +125,7 @@ namespace PlayerVault.Tests
             vault.Spend("coins", 30);
             Run(vault.FlushAsync());
 
-            Assert.Throws<InvalidOperationException>(() => Run(Vault.DeleteSaveAsync(Player, storage)));
+            Assert.Throws<InvalidOperationException>(() => Run(Vault.DeleteSaveAsync(Player, storage, KeyStoreFor(storage))));
             Assert.IsTrue(storage.Has(Player), "the save must be left alone");
         }
 
@@ -142,7 +142,7 @@ namespace PlayerVault.Tests
 
                 Assert.AreEqual(2, Directory.GetFiles(folder).Length, "a save and a quarantined copy");
 
-                Run(Vault.DeleteSaveAsync(Player, storage));
+                Run(Vault.DeleteSaveAsync(Player, storage, KeyStoreFor(storage)));
 
                 Assert.IsEmpty(Directory.GetFiles(folder));
             }

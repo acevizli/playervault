@@ -12,7 +12,9 @@ namespace PlayerVault.Internal
     {
         const string TimestampFormat = "o";
 
-        public static string Serialize(VaultDocument document) => JsonUtility.ToJson(document, true);
+        /// <param name="pretty">Indented for a person reading the file. Off when the document is
+        /// sealed, where it is stored as one escaped string and indentation only adds noise.</param>
+        public static string Serialize(VaultDocument document, bool pretty = true) => JsonUtility.ToJson(document, pretty);
 
         /// <summary>
         /// Parses a saved document. Returns false instead of throwing, so the caller can apply

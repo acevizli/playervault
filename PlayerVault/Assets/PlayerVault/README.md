@@ -40,7 +40,7 @@ already open. Components for the same player share one vault across scenes; tick
 Across Scenes** to keep it open through scene loads. To reset a test player, use **Delete Save**
 on the component's context menu, or `Vault.DeleteSaveAsync(playerId)` from code.
 
-## The five things worth knowing
+## The six things worth knowing
 
 1. **A reward id is granted once, ever** — across restarts, concurrent callers and replays. The
    guard is derived from the stored claim records, so it cannot drift out of step with them.
@@ -52,7 +52,11 @@ on the component's context menu, or `Vault.DeleteSaveAsync(playerId)` from code.
 4. **The `Async` forms are the durable ones.** They complete once the change is on disk and roll
    back in memory if it could not be written. `Spend` and `GrantLocal` schedule their write and
    return immediately — right for a coin pickup, wrong for a purchase.
-5. **Events arrive on whichever thread finished the work.** Touching a `GameObject` from one will
+5. **An edited save does not open.** Saves are signed with a key kept in the iOS Keychain or
+   Android Keystore, and a save that was edited, or an older copy put back, fails with
+   `VaultTamperedException` and stays blocked until `DeleteSaveAsync`. Edit the save by hand in
+   the editor to test your game's handling.
+6. **Events arrive on whichever thread finished the work.** Touching a `GameObject` from one will
    throw. Subscribe through `VaultBehaviour`, which re-raises them on the main thread.
 
 ## Full documentation

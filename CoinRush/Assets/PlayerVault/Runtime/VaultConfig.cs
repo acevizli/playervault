@@ -17,6 +17,23 @@ namespace PlayerVault
         Throw
     }
 
+    /// <summary>What to do when the save fails its tamper check.</summary>
+    public enum TamperedDataPolicy
+    {
+        /// <summary>
+        /// Refuse to open, leaving the save in place, so the game can block the player. Opening
+        /// throws <see cref="VaultTamperedException"/> every time until the save is deleted. This
+        /// is the default.
+        /// </summary>
+        Block,
+
+        /// <summary>
+        /// Move the save aside, log an error and start with a new save, as for an unreadable one.
+        /// The player loses their progress, including whatever the edit gave them.
+        /// </summary>
+        Quarantine
+    }
+
     /// <summary>When balance changes reach disk.</summary>
     public enum FlushMode
     {
@@ -52,6 +69,19 @@ namespace PlayerVault
 
         public CorruptDataPolicy OnCorruptData { get; set; } = CorruptDataPolicy.Quarantine;
 
+        /// <summary>
+        /// Sign every save and check the signature on open, so a save edited outside the game, or
+        /// an older copy put back, is detected. On by default. See <see cref="IVaultKeyStore"/>.
+        /// </summary>
+        /// <remarks>
+        /// This detects edits made through a file manager, adb or a backup tool, and saves copied
+        /// from another device. It does not stop a player on a rooted or jailbroken device, who can
+        /// make the game itself sign anything. Only a server that owns the balances can.
+        /// </remarks>
+        public bool DetectTampering { get; set; } = true;
+
+        public TamperedDataPolicy OnTampered { get; set; } = TamperedDataPolicy.Block;
+
         public FlushMode FlushMode { get; set; } = FlushMode.Immediate;
 
         public TimeSpan DebounceInterval { get; set; } = TimeSpan.FromSeconds(1);
@@ -61,6 +91,13 @@ namespace PlayerVault
 
         /// <summary>Defaults to <see cref="JsonFileStorage"/> under Application.persistentDataPath.</summary>
         public IVaultStorage Storage { get; set; }
+
+        /// <summary>
+        /// Where the save signing key and counter are kept. Defaults to the iOS Keychain, the
+        /// Android Keystore, and <see cref="FileKeyStore"/> everywhere else. Only used when
+        /// <see cref="DetectTampering"/> is on.
+        /// </summary>
+        public IVaultKeyStore KeyStore { get; set; }
 
         /// <summary>Defaults to <see cref="SystemClock"/>.</summary>
         public IVaultClock Clock { get; set; }

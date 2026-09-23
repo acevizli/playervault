@@ -117,6 +117,7 @@ namespace CoinRush
 
         GameObject _menuPanel;
         GameObject _vaultPanel;
+        GameObject _blockedPanel;
         float _noticeUntil;
         float _claimUntil;
         float _panelRefreshAt;
@@ -139,6 +140,7 @@ namespace CoinRush
             _level.RetryOfferChanged += OnRetryOfferChanged;
             _level.UnlocksChanged += RefreshMenu;
             _level.Notice += OnNotice;
+            _level.Blocked += OnBlocked;
         }
 
         void OnDisable()
@@ -152,6 +154,7 @@ namespace CoinRush
             _level.RetryOfferChanged -= OnRetryOfferChanged;
             _level.UnlocksChanged -= RefreshMenu;
             _level.Notice -= OnNotice;
+            _level.Blocked -= OnBlocked;
         }
 
         void Update()
@@ -560,6 +563,7 @@ namespace CoinRush
 
             BuildMenu(root);
             BuildVaultPanel(root);
+            BuildBlockedPanel(root);
 
             // The vault opens asynchronously, so show a loading message until it is ready.
             _banner.text = "OPENING VAULT";
@@ -649,6 +653,42 @@ namespace CoinRush
             close.Button.onClick.AddListener(ToggleVaultPanel);
 
             _vaultPanel.SetActive(false);
+        }
+
+        /// <summary>
+        /// Shown when the save failed its tamper check. Built last so it covers everything,
+        /// including the VAULT button, and its backdrop takes every tap. It has no buttons: the
+        /// player stays blocked.
+        /// </summary>
+        void BuildBlockedPanel(Transform root)
+        {
+            var panel = CreateGroup(root, "BlockedPanel",
+                new Vector2(0f, 0f), new Vector2(1f, 1f), Vector2.zero, Vector2.zero);
+
+            _blockedPanel = panel.gameObject;
+
+            CreatePanel(panel, "Backdrop", new Color(0.03f, 0.03f, 0.05f, 1f),
+                new Vector2(0f, 0f), new Vector2(1f, 1f),
+                new Vector2(-Bleed, -Bleed), new Vector2(Bleed, Bleed)).raycastTarget = true;
+
+            CreateLabel(panel, "Title", TextAnchor.LowerCenter,
+                new Vector2(0f, 0.5f), new Vector2(1f, 0.5f),
+                new Vector2(48f, 120f), new Vector2(-48f, 360f), 72, Bad).text = "SAVE MODIFIED";
+
+            CreateLabel(panel, "Message", TextAnchor.UpperCenter,
+                new Vector2(0f, 0.5f), new Vector2(1f, 0.5f),
+                new Vector2(96f, -320f), new Vector2(-96f, 80f), 42, Ink).text =
+                "Your save file was changed outside the game.\n\nYou are blocked from playing.";
+
+            _blockedPanel.SetActive(false);
+        }
+
+        void OnBlocked()
+        {
+            _vaultPanel.SetActive(false);
+            _menuPanel.SetActive(false);
+            _banner.text = string.Empty;
+            _blockedPanel.SetActive(true);
         }
 
         /// <summary>

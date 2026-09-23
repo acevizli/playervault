@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 
 namespace PlayerVault.Tests
@@ -10,6 +11,15 @@ namespace PlayerVault.Tests
     internal static class VaultTestHarness
     {
         public const string Player = "test-player";
+
+        /// <summary>
+        /// One key store per storage. A storage stands for a device, and a restart is a second
+        /// vault on the same storage, so it must find the same key and counter.
+        /// </summary>
+        static readonly ConditionalWeakTable<IVaultStorage, InMemoryKeyStore> KeyStores =
+            new ConditionalWeakTable<IVaultStorage, InMemoryKeyStore>();
+
+        public static InMemoryKeyStore KeyStoreFor(IVaultStorage storage) => KeyStores.GetOrCreateValue(storage);
 
         /// <summary>
         /// Runs a task to completion synchronously.
@@ -32,12 +42,15 @@ namespace PlayerVault.Tests
             int maxAttempts = 3,
             string playerId = Player)
         {
+            storage ??= new InMemoryStorage();
+
             var config = new VaultConfig
             {
                 PlayerId = playerId,
                 ApiUrl = "https://example.test/claim",
                 Transport = transport ?? FakeTransport.Ok(),
-                Storage = storage ?? new InMemoryStorage(),
+                Storage = storage,
+                KeyStore = KeyStoreFor(storage),
                 Clock = clock ?? new FakeClock(),
                 Logger = logger ?? new NullLogger(),
                 ResumePendingOnOpen = false,

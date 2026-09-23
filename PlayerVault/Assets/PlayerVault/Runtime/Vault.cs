@@ -41,6 +41,7 @@ namespace PlayerVault
         readonly IVaultStorage _storage;
         readonly IVaultClock _clock;
         readonly IVaultLogger _logger;
+        readonly IVaultKeyStore _keyStore;   // null when tamper detection is off
         readonly RetryPolicy _retry;
         readonly System.Random _random = new System.Random();
 
@@ -50,6 +51,7 @@ namespace PlayerVault
         readonly string _apiUrl;
         readonly bool _allowUndeclaredResources;
         readonly CorruptDataPolicy _onCorruptData;
+        readonly TamperedDataPolicy _onTampered;
         readonly FlushMode _flushMode;
         readonly TimeSpan _debounceInterval;
 
@@ -78,6 +80,9 @@ namespace PlayerVault
         /// </summary>
         long _stateVersion;
         long _writtenVersion;
+
+        /// <summary>Signs each write. Set by <see cref="LoadAsync"/>; null when tamper detection is off.</summary>
+        SaveSeal _seal;
 
         readonly SemaphoreSlim _writeGate = new SemaphoreSlim(1, 1);
         readonly CancellationTokenSource _lifetime = new CancellationTokenSource();
@@ -134,6 +139,7 @@ namespace PlayerVault
             _apiUrl = config.ApiUrl;
             _allowUndeclaredResources = config.AllowUndeclaredResources;
             _onCorruptData = config.OnCorruptData;
+            _onTampered = config.OnTampered;
             _flushMode = config.FlushMode;
             _debounceInterval = config.DebounceInterval;
             _retry = config.Retry.Clone();
@@ -142,6 +148,7 @@ namespace PlayerVault
             _storage = config.Storage ?? new JsonFileStorage();
             _clock = config.Clock ?? new SystemClock();
             _logger = config.Logger ?? new UnityLogger();
+            _keyStore = config.DetectTampering ? config.KeyStore ?? DefaultKeyStore.Create() : null;
             _saveKey = OpenVaults.KeyFor(_storage, _playerId);
 
             foreach (var definition in config.Resources)
@@ -158,6 +165,10 @@ namespace PlayerVault
         /// <exception cref="VaultStorageException">
         /// Saved state exists but could not be read. Nothing was written, so the save is intact
         /// and opening can be retried.
+        /// </exception>
+        /// <exception cref="VaultTamperedException">
+        /// The save was edited or an older copy was put back, and the policy is
+        /// <see cref="TamperedDataPolicy.Block"/>. Retrying fails the same way.
         /// </exception>
         public static async Task<Vault> OpenAsync(VaultConfig config, CancellationToken cancellationToken = default)
         {
@@ -1012,6 +1023,9 @@ namespace PlayerVault
         /// The save is corrupt and the policy is <see cref="CorruptDataPolicy.Throw"/>, the save
         /// was written by a newer SDK version, or it belongs to a different player.
         /// </exception>
+        /// <exception cref="VaultTamperedException">
+        /// The save failed its tamper check and the policy is <see cref="TamperedDataPolicy.Block"/>.
+        /// </exception>
         public async Task LoadAsync(CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
@@ -1028,6 +1042,10 @@ namespace PlayerVault
                 OpenVaults.Release(_saveKey, this);
                 throw new ObjectDisposedException(nameof(Vault));
             }
+
+            // Read before the save, so a key store that is unavailable fails the open without
+            // anything having been decided about the save.
+            var seal = await CreateSealAsync(cancellationToken).ConfigureAwait(false);
 
             string payload;
             try
@@ -1049,6 +1067,13 @@ namespace PlayerVault
 
             if (!string.IsNullOrEmpty(payload))
             {
+                payload = seal != null
+                    ? await UnsealAsync(seal, payload, cancellationToken).ConfigureAwait(false)
+                    : SaveSeal.Unwrap(payload);
+            }
+
+            if (!string.IsNullOrEmpty(payload))
+            {
                 if (VaultSerializer.TryDeserialize(payload, out var document, out var error))
                 {
                     Apply(document);
@@ -1065,7 +1090,90 @@ namespace PlayerVault
                 }
             }
 
-            lock (_sync) _loaded = true;
+            lock (_sync)
+            {
+                _seal = seal;
+                _loaded = true;
+            }
+        }
+
+        async Task<SaveSeal> CreateSealAsync(CancellationToken cancellationToken)
+        {
+            if (_keyStore == null) return null;
+
+            try
+            {
+                var key = await _keyStore.GetOrCreateKeyAsync(_playerId, cancellationToken).ConfigureAwait(false);
+                var counter = await _keyStore.ReadCounterAsync(_playerId, cancellationToken).ConfigureAwait(false);
+                return new SaveSeal(_playerId, key, counter);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                throw new VaultStorageException(
+                    _playerId,
+                    $"PlayerVault could not read the save signing key for '{_playerId}'. " +
+                    "Opening failed; the existing save has not been touched.",
+                    exception);
+            }
+        }
+
+        /// <summary>
+        /// Checks the signature and counter of a stored save. Returns the document to load, or null
+        /// to start fresh after a tampered save was quarantined.
+        /// </summary>
+        async Task<string> UnsealAsync(SaveSeal seal, string stored, CancellationToken cancellationToken)
+        {
+            var check = seal.Open(stored, out var payload, out var envelope);
+
+            switch (check)
+            {
+                case SealCheck.Valid:
+                    // The file is ahead of the key store when the app stopped between writing a
+                    // save and recording its counter. Catch the key store up.
+                    if (seal.Counter > seal.StoredCounter) _ = RecordCounterAsync(seal.Counter);
+                    return payload;
+
+                case SealCheck.Unreadable:
+                    // Not JSON at all: a damaged file rather than an edit, so the corrupt-data
+                    // policy applies when parsing fails.
+                    return stored;
+
+                case SealCheck.NewerSchema:
+                    throw new InvalidOperationException(
+                        $"PlayerVault state for '{_playerId}' was written by a newer SDK " +
+                        $"(schema {envelope.schemaVersion} > {SealedSave.CurrentSchemaVersion}).");
+
+                case SealCheck.WrongPlayer:
+                    throw new InvalidOperationException(
+                        $"PlayerVault state at the location for '{_playerId}' belongs to " +
+                        $"'{envelope.playerId}'. Refusing to load it.");
+            }
+
+            var reason = check == SealCheck.RolledBack ? TamperReason.RolledBack
+                : check == SealCheck.Unsigned ? TamperReason.Unsigned
+                : TamperReason.SignatureMismatch;
+
+            if (_onTampered == TamperedDataPolicy.Block) throw new VaultTamperedException(_playerId, reason);
+
+            _logger.Error($"[PlayerVault] The save for '{_playerId}' failed its tamper check ({reason}). Quarantining and starting fresh.");
+            try { await _storage.QuarantineAsync(_playerId, cancellationToken).ConfigureAwait(false); }
+            catch (Exception exception) { _logger.Error("[PlayerVault] Quarantine failed.", exception); }
+            return null;
+        }
+
+        /// <summary>
+        /// Records the number of the newest save in the key store. Not awaited by writes: the file
+        /// is already safe, a key store only ever raises its counter, and on Android this waits for
+        /// the main thread. If it never lands, the file is simply ahead, which is accepted.
+        /// </summary>
+        async Task RecordCounterAsync(long counter)
+        {
+            try { await _keyStore.WriteCounterAsync(_playerId, counter).ConfigureAwait(false); }
+            catch (Exception exception) { _logger.Error("[PlayerVault] Could not record the save counter.", exception); }
         }
 
         void Apply(VaultDocument document)
@@ -1172,16 +1280,20 @@ namespace PlayerVault
         /// close it, delete, then open a new one. Waits for a vault that is still closing.
         /// </remarks>
         /// <param name="storage">The storage the vault uses. Defaults to <see cref="JsonFileStorage"/>.</param>
+        /// <param name="keyStore">The key store the vault uses. Its key and counter for the player
+        /// are removed too, so a save blocked as tampered can be cleared. Defaults to the platform's.</param>
         /// <exception cref="InvalidOperationException">A vault is open on this save.</exception>
         /// <exception cref="NotSupportedException">The storage does not implement <see cref="IVaultStorage.DeleteAsync"/>.</exception>
         /// <exception cref="VaultStorageException">The storage failed to delete the save.</exception>
         public static async Task DeleteSaveAsync(
-            string playerId, IVaultStorage storage = null, CancellationToken cancellationToken = default)
+            string playerId, IVaultStorage storage = null, IVaultKeyStore keyStore = null,
+            CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(playerId))
                 throw new ArgumentException("A player id is required.", nameof(playerId));
 
             storage ??= new JsonFileStorage();
+            keyStore ??= DefaultKeyStore.Create();
 
             // Hold the save while deleting, so an open that starts meanwhile waits and then
             // loads nothing, instead of reading a half-deleted save.
@@ -1199,6 +1311,7 @@ namespace PlayerVault
             try
             {
                 await storage.DeleteAsync(playerId, cancellationToken).ConfigureAwait(false);
+                await keyStore.DeleteAsync(playerId, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception exception) when (!(exception is NotSupportedException) && !(exception is OperationCanceledException))
             {
@@ -1225,11 +1338,13 @@ namespace PlayerVault
         string SerializeLocked(out long version)
         {
             version = ++_stateVersion;
-            return VaultSerializer.Serialize(SnapshotLocked());
+            return VaultSerializer.Serialize(SnapshotLocked(), pretty: _keyStore == null);
         }
 
         async Task WriteAsync(long version, string payload)
         {
+            long sealedCounter = 0;
+
             await _writeGate.WaitAsync().ConfigureAwait(false);
             try
             {
@@ -1243,7 +1358,10 @@ namespace PlayerVault
                     throw new ObjectDisposedException(nameof(Vault),
                         "The vault was disposed before this change was written. Use CloseAsync to save before closing.");
 
-                await _storage.WriteAsync(_playerId, payload).ConfigureAwait(false);
+                // Sealed under the write gate, so counters follow the order files are written in.
+                var stored = _seal != null ? _seal.Seal(payload, out sealedCounter) : payload;
+
+                await _storage.WriteAsync(_playerId, stored).ConfigureAwait(false);
                 _writtenVersion = version;
             }
             catch (Exception exception)
@@ -1255,6 +1373,9 @@ namespace PlayerVault
             {
                 _writeGate.Release();
             }
+
+            // Only reached when the write succeeded. The counter follows the file, never leads it.
+            if (sealedCounter > 0) _ = RecordCounterAsync(sealedCounter);
         }
 
         void SchedulePersist()

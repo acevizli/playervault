@@ -176,6 +176,12 @@ namespace CoinRush
         /// <summary>Short messages for the HUD, such as clamped grants or refused purchases.</summary>
         public event Action<string> Notice;
 
+        /// <summary>
+        /// Raised when the save failed PlayerVault's tamper check. The game stays in
+        /// <see cref="LevelPhase.Booting"/> for good: there is no vault to play against.
+        /// </summary>
+        public event Action Blocked;
+
         void Start()
         {
             if (ball != null)
@@ -256,6 +262,16 @@ namespace CoinRush
 
         void OnVaultOpenFailed(Exception exception)
         {
+            // The save was edited, or an older copy put back. The vault leaves it in place, so
+            // this happens on every launch; only deleting the save (Tools > PlayerVault in the
+            // editor) lets the player back in.
+            if (exception is VaultTamperedException tampered)
+            {
+                Debug.LogError($"[CoinRush] Blocked: {tampered.Message} ({tampered.Reason})");
+                Blocked?.Invoke();
+                return;
+            }
+
             Debug.LogError($"[CoinRush] The vault could not be opened: {exception.Message}");
             Notice?.Invoke("COULD NOT LOAD YOUR PROGRESS");
         }

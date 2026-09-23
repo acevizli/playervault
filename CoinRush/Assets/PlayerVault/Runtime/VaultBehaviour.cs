@@ -110,6 +110,15 @@ namespace PlayerVault
         [Tooltip("Quarantine moves an unreadable save aside and starts a new one. Throw fails the open.")]
         [SerializeField] CorruptDataPolicy onCorruptData = CorruptDataPolicy.Quarantine;
 
+        [Header("Tamper Detection")]
+        [Tooltip("Sign every save and check it on open, so a save edited outside the game, or an older " +
+                 "copy put back, is detected. The key is kept in the iOS Keychain or Android Keystore.")]
+        [SerializeField] bool detectTampering = true;
+
+        [Tooltip("Block fails the open and leaves the save in place, so the game can lock the player out. " +
+                 "Quarantine moves the save aside and starts a new one.")]
+        [SerializeField] TamperedDataPolicy onTampered = TamperedDataPolicy.Block;
+
         /// <summary>
         /// Work queued from background threads and run in <see cref="Update"/>. A queue is used
         /// instead of a captured SynchronizationContext, which may not be set yet during the first
@@ -203,7 +212,8 @@ namespace PlayerVault
         /// Raised on the main thread when opening fails. The component can still be used: fix
         /// the cause and call <see cref="OpenAsync()"/> again. Usually a
         /// <see cref="VaultStorageException"/> for an unreadable save, which a game may want to
-        /// show as "could not load your progress".
+        /// show as "could not load your progress", or a <see cref="VaultTamperedException"/> for
+        /// a save that was edited, which opening again will not fix.
         /// </summary>
         public event Action<Exception> OpenFailed;
 
@@ -486,7 +496,7 @@ namespace PlayerVault
         /// to <see cref="OpenAsync(VaultConfig)"/>.
         /// </summary>
         /// <remarks>
-        /// Transport, Storage, Clock and Logger are not serialized fields because they are code
+        /// Transport, Storage, KeyStore, Clock and Logger are not serialized fields because they are code
         /// dependencies, not scene settings. Set them on the returned config to keep the Inspector
         /// settings and use your own implementations.
         /// </remarks>
@@ -499,6 +509,8 @@ namespace PlayerVault
                 AllowUndeclaredResources = allowUndeclaredResources,
                 ResumePendingOnOpen = resumePendingOnOpen,
                 OnCorruptData = onCorruptData,
+                DetectTampering = detectTampering,
+                OnTampered = onTampered,
                 FlushMode = flushMode,
                 DebounceInterval = TimeSpan.FromSeconds(debounceIntervalSeconds),
                 Retry = new RetryPolicy

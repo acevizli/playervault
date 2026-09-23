@@ -145,6 +145,29 @@ The synchronous `Spend`/`GrantLocal` schedule their write and report failures th
 
 **Corruption.** A save that parses as nothing recognisable is moved aside with a `.corrupt-<timestamp>` suffix and the player starts fresh (`CorruptDataPolicy.Quarantine`, the default) — a player who cannot launch is worse off than one who lost progress, and the quarantined file keeps support recovery possible. `CorruptDataPolicy.Throw` hands the decision to the game instead. A save written by a newer SDK is always refused rather than truncated.
 
+### Tamper detection
+
+The save lives where a player can reach it: `adb pull` on Android, the Files app or a backup editor on iOS. Without a check, changing `"value":60` to `"value":99999` in a text editor is enough. `VaultConfig.DetectTampering` is on by default and has two jobs.
+
+- **Edits.** Every save is written inside an envelope, `{ schemaVersion: 2, playerId, counter, mac, payload }`, where `mac` is an HMAC-SHA256 over the version, the player id, the counter and the document. The key is 32 random bytes per player that never enter the save file. It uses HMAC, not a public-key signature, because the same device writes the save and checks it, so no one needs to be able to check without being able to sign.
+- **Putting an old copy back.** A copy of an older save is still correctly signed. Putting it back after a claim would remove the claim and let the reward be granted a second time. `counter` goes up with every write, and the key store keeps the number of the last save written. A save with a lower number than that was put back.
+
+The file is written first and the counter recorded second, so a crash between the two leaves the file one ahead. That is accepted, and the key store catches up on the next open. An honest crash never looks like tampering. The envelope sits in the same file as the data, so the atomic rename still covers everything.
+
+**Where the key lives** (`IVaultKeyStore`, which you can replace; the signing and checks cannot be):
+
+| Platform | Key | Counter |
+| --- | --- | --- |
+| iOS | Keychain item, `AfterFirstUnlockThisDeviceOnly` (`Plugins/iOS/PlayerVaultKeychain.mm`) | Keychain item |
+| Android | Private SharedPreferences, encrypted by a non-exportable AES key in the Android Keystore (`Plugins/Android/PlayerVaultKeyStore.java`) | Private SharedPreferences |
+| Editor, Standalone | `FileKeyStore`: a plain file in `playervault/keys/` next to the saves | Same file |
+
+The editor store protects nothing, but it runs the same checks. Edit a save by hand in the editor and the next open detects it, and that is how to test a game's handling. On Android the Java calls run on the main thread, because a thread-pool thread would have to be attached to the Java VM. The vault only calls the key store when opening and after each write, without waiting.
+
+**When the check fails.** `TamperedDataPolicy.Block` (the default) fails the open with `VaultTamperedException` (`Reason`: `Unsigned`, `SignatureMismatch` or `RolledBack`) and leaves the save in place, so every launch fails the same way until `Vault.DeleteSaveAsync` clears the save and its key-store entries. `Quarantine` moves the save aside and starts fresh, like a corrupt save. A tampered save is kept separate from a corrupt one: a file that is not JSON at all still goes through `OnCorruptData`, so a failing disk is not reported as cheating. A save with no signature counts as tampered. This includes a plain v1 save, since nothing shipped before signing did.
+
+**What it does not do.** It stops editing and sharing save files. It does not stop a player on a rooted or jailbroken device, who cannot extract the key but can make the running game sign anything. Nothing on the device can stop that. Only a server that owns the balances can, which this case rules out. The key never leaves the device, so a save restored onto another phone fails its check. Everything here is local and there are no accounts, so that is accepted.
+
 ### Threading and lifecycle
 
 Every public member of `Vault` is safe to call from any thread. One lock guards the ledger; each durable operation mutates state and takes the snapshot it is about to write inside that same lock, so a snapshot can never catch a half-applied change. Waiting — the network, the disk — happens outside it, which is what keeps a pending claim from blocking a spend.
@@ -225,7 +248,7 @@ inside the one `-executeMethod` call sidesteps that; it is possible only because
 `VaultBehaviour` tests need to create GameObjects. `BatchTestRunner` is development scaffolding
 and is not part of the exported package.
 
-**Last run: 88 passed, 0 failed, 0 skipped** (Unity 6000.6.2f1, macOS).
+**Last run: 103 passed, 0 failed, 0 skipped** (Unity 6000.6.2f1, macOS).
 
 **EditMode** (no scene, no network — every dependency is a double):
 
@@ -234,6 +257,7 @@ and is not part of the exported package.
 - `PersistenceTests` — restart survival, the guard outliving a session, write-ahead ordering, unreadable and newer-schema saves, storage failure at every boundary, player identity isolation.
 - `ReliabilityTests` — reentrant claims from an event, conflicting retry payloads, a crash at the grant commit, throwing subscribers, disposal mid-write, config mutated after opening, spending while a claim completes on another thread, asynchronously completing dependencies.
 - `LifecycleTests` — one vault per save, a reopen waiting for the previous vault's last write, deleting a save, components sharing a vault, `WhenOpen` before, after and across a failed open.
+- `IntegrityTests` — an edited balance, counter, signature or player id; a save put back after a claim; an unsigned save; a deleted save; a crash between writing the save and recording its counter; the quarantine policy; an unavailable key store; detection turned off; an edited file on disk.
 - `TransactionTests` — atomic purchases, refusals that move nothing, already-owned items, storage failure, step ordering, clamping.
 
 **PlayMode** (`LiveEndpointTests`) — smoke tests against the real endpoint over `UnityWebRequest`, plus an unreachable-host case. Network-dependent by design; they are the only tests that can fail because of somebody else's outage.
@@ -241,6 +265,7 @@ and is not part of the exported package.
 ### Known limitations
 
 - **No authentication or server-side validation.** The sample endpoint echoes whatever it is sent, so "the backend accepted it" means "the request completed". A production economy needs signed requests, server-side reward validation and cross-device reconciliation, all of which sit behind `IVaultTransport`.
+- **Tamper detection stops file edits, not rooted devices.** See [Tamper detection](#tamper-detection). A save moved to another device also fails its check.
 - **Claim history grows without bound.** Every persistence operation serializes the whole document, and granted records accumulate. Fine at CoinRush's scale; a game with frequent claims and a long history should profile before shipping, and any compaction must preserve the duplicate-prevention information.
 - **One vault per save, per process.** The guard is in memory, so it does not stop two processes — an editor and a standalone build, say — from sharing a save folder.
 - **Backoff is per session.** There is no persistent retry schedule across launches — unsettled claims replay on the next open, or whenever the game calls `ResumePendingAsync()`.
