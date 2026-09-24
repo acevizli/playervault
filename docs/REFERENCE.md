@@ -27,13 +27,13 @@ var vault = await Vault.OpenAsync(new VaultConfig
 
 `Vault.OpenAsync(config, cancellationToken)` creates the vault, loads the save and starts retrying unfinished claims in the background. It does not wait for the network. `new Vault(config)` followed by `LoadAsync()` does the same in two steps.
 
-An invalid config throws `ArgumentException` from `OpenAsync` or the constructor.
+An invalid config throws `ArgumentException` from `OpenAsync` or the constructor. Create the vault on Unity's main thread unless the config sets its own `Transport`, `Storage` and `KeyStore`: the defaults read `Application.persistentDataPath` and capture the main thread's context, so creating them elsewhere throws `InvalidOperationException`. `VaultBehaviour` handles this for you.
 
 | Exception from opening | Meaning |
 | --- | --- |
 | `VaultStorageException` | A save exists but could not be read. Nothing was written; opening can be retried. |
 | `VaultTamperedException` | The save was edited or an older copy was put back (`OnTampered = Block`). `Reason` is `Unsigned`, `SignatureMismatch` or `RolledBack`. |
-| `InvalidOperationException` | A vault is already open on this save, the save is corrupt with `OnCorruptData = Throw`, it was written by a newer SDK, or it belongs to another player. |
+| `InvalidOperationException` | A vault is already open on this save, the save is corrupt (an empty file counts) with `OnCorruptData = Throw`, it was written by a newer SDK, or it belongs to another player. |
 
 ### VaultConfig
 
@@ -46,7 +46,7 @@ An invalid config throws `ArgumentException` from `OpenAsync` or the constructor
 | `ResumePendingOnOpen` | `true` | Retry pending claims in the background after opening. |
 | `Retry` | `new RetryPolicy()` | See below. |
 | `FlushMode` | `Immediate` | `Debounced` coalesces writes within `DebounceInterval` (1 s). |
-| `OnCorruptData` | `Quarantine` | `Quarantine` moves an unreadable save aside and starts fresh; `Throw` fails the open. |
+| `OnCorruptData` | `Quarantine` | `Quarantine` moves an unreadable save aside and starts fresh; `Throw` fails the open. An empty or truncated file is unreadable; only a missing file is a new player. |
 | `DetectTampering` | `true` | Sign saves and check them on open. |
 | `OnTampered` | `Block` | `Block` fails the open; `Quarantine` moves the save aside and starts fresh. |
 | `Transport`, `Storage`, `KeyStore`, `Clock`, `Logger` | Unity defaults | See [Extension points](#extension-points). |
@@ -152,7 +152,7 @@ switch (result.Status)
 { "player_id": "test-player", "reward_id": "level-10-first-completion", "resource": "coins", "amount": 100 }
 ```
 
-to `ApiUrl` and applies the amount after a successful response. A reward id is granted at most once per player, across restarts. Calling again returns `AlreadyGranted` without sending a request, and concurrent calls for the same id share one request.
+to `ApiUrl` and applies the amount after a successful response. A reward id is granted at most once per player, across restarts. Calling again returns `AlreadyGranted` without sending a request, and concurrent calls for the same id share one request. A concurrent call with the same id but a different resource or amount gets `Conflict` instead.
 
 | `ClaimStatus` | |
 | --- | --- |
@@ -161,7 +161,7 @@ to `ApiUrl` and applies the amount after a successful response. A reward id is g
 | `Pending` | Not finished: offline, timed out or out of attempts. Retried on next open and by `ResumePendingAsync()`. |
 | `Failed` | Refused for good (4xx, unparseable response, invalid input). |
 
-`ClaimFailure` gives the reason: `None`, `Rejected`, `Network`, `Parse`, `Cancelled`, `Invalid`, `Storage`, `Conflict` (the id is already pending with a different resource or amount; retry with the original values).
+`ClaimFailure` gives the reason: `None`, `Rejected`, `Network`, `Parse`, `Cancelled`, `Invalid`, `Storage`, `Conflict` (the id is already pending or in flight with a different resource or amount; retry with the original values).
 
 ### ClaimResult
 
@@ -197,7 +197,7 @@ to `ApiUrl` and applies the amount after a successful response. A reward id is g
 | `BalanceChanged(string resource, long balance)` | After a balance change is saved. |
 | `ClaimStateChanged(ClaimRecord record)` | Whenever a claim changes state. |
 
-`Vault` raises these on the thread that finished the work, which after a claim is a thread-pool thread. To update UI, subscribe on `VaultBehaviour` instead: it raises the same events on the main thread. Exceptions thrown by handlers are logged and ignored.
+`Vault` raises these on the thread that finished the work, which after a claim is a thread-pool thread. To update UI, subscribe on `VaultBehaviour` instead: it raises the same events on the main thread. Each handler is called separately, and one that throws is logged without stopping the others.
 
 ---
 
@@ -207,11 +207,13 @@ to `ApiUrl` and applies the amount after a successful response. A reward id is g
 | --- | --- |
 | `PlayerId`, `ApiUrl` | Fixed when the vault is created. To switch player, close and open a new vault. |
 | `FlushAsync()` | Write now; completes when saved. |
-| `CloseAsync()` | Flush, dispose and complete once the last write is on disk. Use on logout or teardown. |
+| `CloseAsync()` | Flush, dispose and complete once the last write is on disk. Use on logout or teardown. If the final write fails it throws `VaultStorageException` and the vault stays open with everything in memory: call `CloseAsync()` again to retry, or `Dispose()` to give up the unsaved changes. |
 | `Dispose()` | Cancel in-flight work and return at once. Unwritten debounced changes are dropped. |
 | `Vault.DeleteSaveAsync(playerId, storage = null, keyStore = null)` | Delete a player's save and its tamper-check data. Throws `InvalidOperationException` while a vault is open on it. |
 
 Only one vault can be open per save. Opening a save whose previous vault is still closing waits for its last write.
+
+Durable operations (`SpendAsync`, `GrantAsync`, `TransactAsync`, and the writes inside a claim) commit one at a time: each one's change and write finish, or are undone, before the next one takes its snapshot. An operation reported as failed therefore never reaches disk through a later write. Network waits are not part of a commit, so a pending claim never blocks a spend.
 
 Saves are stored at `Application.persistentDataPath/playervault/`. In the editor, **Tools → PlayerVault** shows the folder or deletes every save.
 
@@ -238,7 +240,7 @@ void OnVaultOpened(Vault vault) => coinsLabel.text = vault.GetBalance("coins").T
 | `Vault`, `IsOpen` | The open vault, or null. |
 | `WhenOpen(onOpen, onFailed = null)` | Run `onOpen` now if open, otherwise when it opens. Dispose the returned handle to unsubscribe. |
 | `WhenOpenAsync()` | Awaitable form of `WhenOpen`. |
-| `Opened`, `OpenFailed`, `OpenError`, `HasFailedToOpen` | Open notifications and the last failure. Call `OpenAsync()` again to retry. |
+| `Opened`, `OpenFailed`, `OpenError`, `HasFailedToOpen` | Open notifications and the last failure. Call `OpenAsync()` again to retry. A handler that throws is logged and does not stop the others. |
 | `BalanceChanged`, `ClaimStateChanged` | The vault's events, raised on the main thread. |
 | `PlayerId` | Settable before opening, e.g. after sign-in with Open On Awake off. |
 | `OpenAsync()` / `OpenAsync(config)` | Open with Inspector settings, or with a config you adjusted. |

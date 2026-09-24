@@ -131,6 +131,38 @@ namespace PlayerVault.Tests
         }
 
         [Test]
+        public void An_empty_save_is_damaged_rather_than_a_new_player()
+        {
+            // An empty file used to load as starting balances with no claims, bypassing both
+            // the corrupt-data policy and tamper detection.
+            var storage = new InMemoryStorage();
+
+            using (var vault = Open(Config(FakeTransport.Ok(), storage)))
+                Run(vault.ClaimAsync("level-10", "coins", 250));
+
+            storage.Seed(Player, string.Empty);
+
+            var config = Config(storage: storage);
+            config.OnCorruptData = CorruptDataPolicy.Throw;
+
+            Assert.Throws<InvalidOperationException>(() => Open(config));
+            Assert.AreEqual(string.Empty, storage.Read(Player), "the save is left for the game to deal with");
+        }
+
+        [Test]
+        public void An_empty_save_is_quarantined_under_the_default_policy()
+        {
+            var storage = new InMemoryStorage();
+            var logger = new NullLogger();
+            storage.Seed(Player, string.Empty);
+
+            using var vault = Open(Config(storage: storage, logger: logger));
+
+            Assert.AreEqual(1, storage.Quarantined.Count);
+            Assert.IsNotEmpty(logger.Errors, "starting over must be reported");
+        }
+
+        [Test]
         public void State_from_a_newer_SDK_is_refused_rather_than_truncated()
         {
             var storage = new InMemoryStorage();

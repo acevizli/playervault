@@ -65,6 +65,31 @@ namespace PlayerVault.Tests
         }
 
         [Test]
+        public void A_claim_joining_a_running_one_with_a_different_payload_is_refused()
+        {
+            // The second call used to join the first and report its Granted result as its own.
+            var gate = new TaskCompletionSource<bool>();
+            var transport = FakeTransport.Ok();
+            transport.Gate = gate.Task;
+
+            using var vault = Open(Config(transport));
+
+            var first = vault.ClaimAsync("level-10", "coins", 250);
+            var joining = vault.ClaimAsync("level-10", "lives", 1);
+
+            Assert.IsTrue(joining.IsCompleted, "a conflicting call must be refused, not wait for the running claim");
+            var second = Run(joining);
+            Assert.AreEqual(ClaimStatus.Failed, second.Status);
+            Assert.AreEqual(ClaimFailure.Conflict, second.Failure);
+
+            gate.SetResult(true);
+            Assert.AreEqual(ClaimStatus.Granted, Run(first).Status);
+            Assert.AreEqual(350, vault.GetBalance("coins"));
+            Assert.AreEqual(3, vault.GetBalance("lives"), "the conflicting request grants nothing");
+            Assert.AreEqual(1, transport.CallCount);
+        }
+
+        [Test]
         public void A_claim_that_is_accepted_but_unsaveable_stays_pending_and_settles_on_the_next_launch()
         {
             // Simulates a failure at the grant write: the request succeeded but the write did
@@ -113,6 +138,25 @@ namespace PlayerVault.Tests
 
             Assert.AreEqual(70, reopened.GetBalance("coins"), "the deduction must reach disk despite the handler");
             Assert.IsNotEmpty(logger.Errors, "and the broken handler must be reported rather than hidden");
+        }
+
+        [Test]
+        public void One_throwing_subscriber_does_not_hide_the_event_from_the_others()
+        {
+            using var vault = Open(Config());
+
+            var balances = 0;
+            var claims = 0;
+            vault.BalanceChanged += (resource, balance) => throw new InvalidOperationException("a broken HUD");
+            vault.BalanceChanged += (resource, balance) => balances++;
+            vault.ClaimStateChanged += record => throw new InvalidOperationException("a broken HUD");
+            vault.ClaimStateChanged += record => claims++;
+
+            vault.Spend("coins", 10);
+            Run(vault.ClaimAsync("level-10", "coins", 250));
+
+            Assert.AreEqual(2, balances, "the spend and the grant");
+            Assert.AreEqual(2, claims, "pending, then granted");
         }
 
         [Test]
@@ -244,6 +288,44 @@ namespace PlayerVault.Tests
 
             using var reopened = Open(Config(storage: storage));
             Assert.AreEqual(75, reopened.GetBalance("coins"), "a debounced change must survive an orderly shutdown");
+        }
+
+        [Test]
+        public void A_close_whose_final_write_fails_throws_and_keeps_the_vault_open()
+        {
+            var storage = new InMemoryStorage();
+            var vault = Open(Config(storage: storage));
+
+            storage.FailWrites = true;
+            vault.GrantLocal("coins", 50);
+
+            Assert.Throws<VaultStorageException>(() => Run(vault.CloseAsync()), "a lost final save must be reported");
+            Assert.AreEqual(150, vault.GetBalance("coins"), "the vault stays open with the unsaved change");
+            Assert.Throws<InvalidOperationException>(() => Open(Config(storage: storage)),
+                "the save is still in use, so another vault cannot load the stale file");
+
+            storage.FailWrites = false;
+            Run(vault.CloseAsync());
+
+            using var reopened = Open(Config(storage: storage));
+            Assert.AreEqual(150, reopened.GetBalance("coins"), "a retried close saves everything");
+        }
+
+        [Test]
+        public void Disposing_after_a_failed_close_gives_up_the_changes_and_frees_the_save()
+        {
+            var storage = new InMemoryStorage();
+            var vault = Open(Config(storage: storage));
+
+            storage.FailWrites = true;
+            vault.GrantLocal("coins", 50);
+            Assert.Throws<VaultStorageException>(() => Run(vault.CloseAsync()));
+
+            vault.Dispose();
+            storage.FailWrites = false;
+
+            using var reopened = Open(Config(storage: storage));
+            Assert.AreEqual(100, reopened.GetBalance("coins"));
         }
     }
 

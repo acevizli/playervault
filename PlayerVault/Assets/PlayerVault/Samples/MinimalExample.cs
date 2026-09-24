@@ -1,4 +1,6 @@
 using System;
+using System.Threading;
+using System.Threading.Tasks;
 using UnityEngine;
 
 namespace PlayerVault.Samples
@@ -26,9 +28,30 @@ namespace PlayerVault.Samples
         /// <summary>The sample endpoint. It echoes back whatever is posted to it.</summary>
         [SerializeField] string apiUrl = "https://httpbin.org/anything";
 
+        /// <summary>Set once the vault is open, and cleared by <see cref="OnDestroy"/>.</summary>
         Vault _vault;
 
+        /// <summary>
+        /// Unity calls this without awaiting it, and an exception escaping an async void method
+        /// is only logged, so everything happens in <see cref="RunAsync"/> and is caught here.
+        /// </summary>
         async void Start()
+        {
+            try
+            {
+                await RunAsync(destroyCancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                // The GameObject was destroyed partway through. OnDestroy has closed the vault.
+            }
+            catch (Exception exception)
+            {
+                Debug.LogException(exception, this);
+            }
+        }
+
+        async Task RunAsync(CancellationToken destroyed)
         {
             // 1. Configure. A player id and a list of resources are required. Transport, storage,
             //    clock, logger and retry policy all have defaults.
@@ -45,43 +68,76 @@ namespace PlayerVault.Samples
             };
 
             // 2. Open. This loads the save and starts retrying any claims left unfinished by an
-            //    earlier session. An unreadable save throws instead of starting a new player, so
-            //    the game can show an error and offer to retry.
+            //    earlier session. Opening can fail in three ways, and each needs a different
+            //    message, so catch them separately.
+            Vault vault;
             try
             {
-                _vault = await Vault.OpenAsync(config);
+                vault = await Vault.OpenAsync(config, destroyed);
+            }
+            catch (VaultTamperedException exception)
+            {
+                // The save was edited or an older copy was put back. Retrying fails the same way;
+                // only Vault.DeleteSaveAsync clears it.
+                Debug.LogError($"This save was changed outside the game: {exception.Reason}");
+                return;
             }
             catch (VaultStorageException exception)
             {
+                // The save could not be read. It is untouched, so the game can offer to retry.
                 Debug.LogError($"Could not load progress: {exception.Message}");
                 return;
             }
+            catch (InvalidOperationException exception)
+            {
+                // The save is unreadable (with OnCorruptData = Throw), was written by a newer
+                // build, or is already open in another vault.
+                Debug.LogError($"Could not open progress: {exception.Message}");
+                return;
+            }
 
-            _vault.BalanceChanged += (resource, balance) => Debug.Log($"[vault] {resource} = {balance}");
-            _vault.ClaimStateChanged += record => Debug.Log($"[vault] {record.RewardId}: {record.Describe()}");
+            // Destroyed while opening: OnDestroy ran before there was a vault to close, so this
+            // method owns it and must close it.
+            if (destroyed.IsCancellationRequested)
+            {
+                await CloseAsync(vault);
+                return;
+            }
 
-            Debug.Log($"coins: {_vault.GetBalance("coins")}, lives: {_vault.GetBalance("lives")}/{_vault.GetMax("lives")}");
+            _vault = vault;
 
-            await SpendSomething();
-            await ClaimAReward();
-            await BuyAHat();
+            vault.BalanceChanged += (resource, balance) => Debug.Log($"[vault] {resource} = {balance}");
+            vault.ClaimStateChanged += record => Debug.Log($"[vault] {record.RewardId}: {record.Describe()}");
 
-            Debug.Log($"{_vault.PendingClaims.Count} claim(s) still settling.");
+            Debug.Log($"coins: {vault.GetBalance("coins")}, lives: {vault.GetBalance("lives")}/{vault.GetMax("lives")}");
+
+            // Each step uses the local vault, not the field: OnDestroy clears the field and
+            // closes the vault, and the check after each await stops before using a closed one.
+            await SpendSomething(vault);
+            destroyed.ThrowIfCancellationRequested();
+
+            await ClaimAReward(vault, destroyed);
+            destroyed.ThrowIfCancellationRequested();
+
+            await BuyAHat(vault);
+            destroyed.ThrowIfCancellationRequested();
+
+            Debug.Log($"{vault.PendingClaims.Count} claim(s) still settling.");
         }
 
         /// <summary>
         /// Spending. A failed spend returns a result instead of throwing.
         /// </summary>
-        async System.Threading.Tasks.Task SpendSomething()
+        static async Task SpendSomething(Vault vault)
         {
             // Spend changes the balance now and saves in the background. Use it for small
             // changes such as a coin pickup or a lost life.
-            var quick = _vault.Spend("lives", 1);
+            var quick = vault.Spend("lives", 1);
             Debug.Log(quick.Success ? $"spent a life, {quick.Balance} left" : $"refused: {quick.Failure}");
 
             // SpendAsync completes once the spend is saved, and undoes it if the save fails. Use
             // it when the game acts on the result.
-            var durable = await _vault.SpendAsync("coins", 10);
+            var durable = await vault.SpendAsync("coins", 10);
             if (!durable.Success) Debug.LogWarning($"refused: {durable.Failure}");
         }
 
@@ -89,9 +145,11 @@ namespace PlayerVault.Samples
         /// Claiming. The backend is asked, and the reward is applied once no matter how often
         /// this runs or when the process is killed.
         /// </summary>
-        async System.Threading.Tasks.Task ClaimAReward()
+        static async Task ClaimAReward(Vault vault, CancellationToken destroyed)
         {
-            var result = await _vault.ClaimAsync("tutorial-complete", "coins", 250);
+            // The token stops the retries when the GameObject is destroyed. The claim stays saved
+            // as pending and is retried on the next launch.
+            var result = await vault.ClaimAsync("tutorial-complete", "coins", 250, destroyed);
 
             switch (result.Status)
             {
@@ -110,7 +168,7 @@ namespace PlayerVault.Samples
                     // Offline, timed out, or out of retries. The claim is saved and is retried on
                     // the next launch, or now with ResumePendingAsync.
                     Debug.Log($"still settling — {result.Record.Describe()}");
-                    await _vault.ResumePendingAsync();
+                    await vault.ResumePendingAsync(destroyed);
                     break;
 
                 case ClaimStatus.Failed:
@@ -124,11 +182,11 @@ namespace PlayerVault.Samples
         /// Buying. The charge and the item are saved in one write, so a crash cannot leave the
         /// player charged without the item.
         /// </summary>
-        async System.Threading.Tasks.Task BuyAHat()
+        static async Task BuyAHat(Vault vault)
         {
-            var result = await _vault.TransactAsync(VaultTransaction.Purchase("coins", 50, "hat"));
+            var result = await vault.TransactAsync(VaultTransaction.Purchase("coins", 50, "hat"));
 
-            if (result.Success) Debug.Log($"bought a hat; {_vault.GetBalance("coins")} coins left");
+            if (result.Success) Debug.Log($"bought a hat; {vault.GetBalance("coins")} coins left");
             else Debug.Log($"no hat: {result.Failure} on '{result.FailedResource}'");
         }
 
@@ -145,14 +203,34 @@ namespace PlayerVault.Samples
             catch (VaultStorageException exception) { Debug.LogError(exception.Message); }
         }
 
-        /// <summary>The game owns the vault, so the game closes it.</summary>
+        /// <summary>
+        /// The game owns the vault, so the game closes it. A vault still opening is closed by
+        /// <see cref="RunAsync"/> once it opens.
+        /// </summary>
         async void OnDestroy()
         {
             if (_vault == null) return;
 
             var closing = _vault;
             _vault = null;
-            await closing.CloseAsync();   // flushes, then disposes
+            await CloseAsync(closing);
+        }
+
+        /// <summary>
+        /// Flushes, then disposes. A failed final write leaves the vault open so it can be
+        /// retried; this object is going away, so it gives up and disposes instead.
+        /// </summary>
+        static async Task CloseAsync(Vault vault)
+        {
+            try
+            {
+                await vault.CloseAsync();
+            }
+            catch (VaultStorageException exception)
+            {
+                Debug.LogError($"Progress since the last save was lost: {exception.Message}");
+                vault.Dispose();
+            }
         }
     }
 }

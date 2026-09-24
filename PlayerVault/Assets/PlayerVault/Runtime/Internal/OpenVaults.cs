@@ -86,6 +86,19 @@ namespace PlayerVault.Internal
             }
         }
 
+        /// <summary>
+        /// Undoes <see cref="BeginRelease"/>: the owner keeps the save after all. Acquires already
+        /// waiting keep waiting for the owner's release task; later ones throw as for a save in use.
+        /// </summary>
+        public static void CancelRelease(object key, object owner)
+        {
+            lock (Sync)
+            {
+                if (Entries.TryGetValue(key, out var entry) && ReferenceEquals(entry.Owner, owner))
+                    entry.Released = null;
+            }
+        }
+
         /// <summary>Frees the save. Call before completing the task passed to <see cref="BeginRelease"/>.</summary>
         public static void Release(object key, object owner)
         {

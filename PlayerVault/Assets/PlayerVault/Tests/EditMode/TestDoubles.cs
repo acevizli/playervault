@@ -98,6 +98,12 @@ namespace PlayerVault.Tests
         /// <summary>Raised inside a write, before it completes. Used by interleaving tests.</summary>
         public Action<string> OnWrite;
 
+        /// <summary>
+        /// Awaited inside a write, after <see cref="OnWrite"/>. Returning a task the test controls
+        /// holds the write open; faulting it fails the write.
+        /// </summary>
+        public Func<string, Task> Hold;
+
         public Dictionary<string, string> Files
         {
             get { lock (_sync) return new Dictionary<string, string>(_files, StringComparer.Ordinal); }
@@ -133,6 +139,9 @@ namespace PlayerVault.Tests
             if (CompleteAsynchronously) await Task.Yield();
 
             OnWrite?.Invoke(payload);
+
+            var hold = Hold?.Invoke(payload);
+            if (hold != null) await hold.ConfigureAwait(false);
 
             if (FailWrites) throw new SimulatedIOException("the save file could not be written");
 

@@ -25,8 +25,16 @@ namespace PlayerVault
     /// <b>Threading.</b> All public members can be called from any thread. One lock guards
     /// balances, claim records and the granted-reward set. Each durable operation changes state
     /// and takes its snapshot under that lock, so a snapshot never contains a half-applied
-    /// change. Network and disk waits happen outside the lock, so a pending claim does not block
-    /// a spend. Events are also raised outside the lock, so handlers can call back into the vault.
+    /// change. Durable operations also commit one at a time: each holds the write gate from its
+    /// change until its write has succeeded or been undone, so a later snapshot never contains a
+    /// change that is still waiting on disk and may yet be rolled back. Network waits happen
+    /// outside both, so a pending claim does not block a spend. Events are raised after both are
+    /// released, so handlers can call back into the vault.
+    /// </para>
+    /// <para>
+    /// Create the vault on Unity's main thread unless the config supplies its own transport,
+    /// storage and key store. The defaults read <c>Application.persistentDataPath</c> and
+    /// capture the main thread's synchronization context when they are constructed.
     /// </para>
     /// <para>
     /// <b>Durability.</b> The <c>Async</c> methods complete after the change is on disk, and undo
@@ -71,19 +79,38 @@ namespace PlayerVault
         readonly HashSet<string> _granted = new HashSet<string>(StringComparer.Ordinal);
 
         /// <summary>Claims in progress, so concurrent calls for one reward share a single request.</summary>
-        readonly Dictionary<string, Task<ClaimResult>> _inFlight =
-            new Dictionary<string, Task<ClaimResult>>(StringComparer.Ordinal);
+        readonly Dictionary<string, InFlightClaim> _inFlight =
+            new Dictionary<string, InFlightClaim>(StringComparer.Ordinal);
+
+        /// <summary>A running claim and what it asked for, so a call with a different request is refused.</summary>
+        sealed class InFlightClaim
+        {
+            public readonly string Resource;
+            public readonly long Amount;
+            public readonly Task<ClaimResult> Task;
+
+            public InFlightClaim(string resource, long amount, Task<ClaimResult> task)
+            {
+                Resource = resource;
+                Amount = amount;
+                Task = task;
+            }
+        }
 
         /// <summary>
-        /// Incremented on every snapshot. A snapshot older than the last one written is skipped,
-        /// so a slow write that finishes late cannot overwrite newer data.
+        /// A background save waiting for the write gate. Changes made before it takes its
+        /// snapshot join it instead of queueing another write, so a burst of coin pickups is
+        /// saved in one or two writes rather than one each.
         /// </summary>
-        long _stateVersion;
-        long _writtenVersion;
+        TaskCompletionSource<bool> _queuedPersist;
 
         /// <summary>Signs each write. Set by <see cref="LoadAsync"/>; null when tamper detection is off.</summary>
         SaveSeal _seal;
 
+        /// <summary>
+        /// Held by a commit from its change until its write has finished or been undone. See
+        /// <see cref="SaveChangeAsync"/>.
+        /// </summary>
         readonly SemaphoreSlim _writeGate = new SemaphoreSlim(1, 1);
         readonly CancellationTokenSource _lifetime = new CancellationTokenSource();
 
@@ -130,6 +157,8 @@ namespace PlayerVault
         /// Creates a vault. Throws if the configuration is invalid. The vault is not usable until
         /// <see cref="LoadAsync"/> has run; <see cref="OpenAsync"/> does both.
         /// </summary>
+        /// <exception cref="InvalidOperationException">Called off Unity's main thread with a config
+        /// that leaves the transport, storage or key store to its default.</exception>
         public Vault(VaultConfig config)
         {
             if (config == null) throw new ArgumentNullException(nameof(config));
@@ -143,6 +172,8 @@ namespace PlayerVault
             _flushMode = config.FlushMode;
             _debounceInterval = config.DebounceInterval;
             _retry = config.Retry.Clone();
+
+            config.ThrowIfDefaultsOffMainThread();
 
             _transport = config.Transport ?? new UnityWebRequestTransport(_retry.Timeout);
             _storage = config.Storage ?? new JsonFileStorage();
@@ -269,36 +300,24 @@ namespace PlayerVault
             ThrowIfDisposed();
             await EnsureLoadedAsync(default).ConfigureAwait(false);
 
-            SpendResult result;
-            long version;
-            string payload;
-
-            lock (_sync)
-            {
-                result = TrySpendLocked(resource, amount);
-                if (!result.Success) return result;
-                payload = SerializeLocked(out version);
-            }
+            var result = default(SpendResult);
 
             try
             {
-                await WriteAsync(version, payload).ConfigureAwait(false);
+                await SaveChangeAsync(
+                    () => (result = TrySpendLocked(resource, amount)).Success,
+                    () => ApplyClampedLocked(resource, amount)).ConfigureAwait(false);   // undo the spend
             }
             catch (VaultStorageException exception)
             {
-                long balance;
-                lock (_sync)
-                {
-                    ApplyClampedLocked(resource, amount);   // undo the spend
-                    balance = GetBalanceLocked(resource);
-                }
-
                 _logger.Error(
                     $"[PlayerVault] Spending {amount} {resource} was rolled back: the change could not be saved.",
                     exception);
 
-                return SpendResult.Fail(SpendFailure.StorageUnavailable, balance);
+                return SpendResult.Fail(SpendFailure.StorageUnavailable, GetBalance(resource));
             }
+
+            if (!result.Success) return result;
 
             RaiseBalanceChanged(resource);
             return result;
@@ -331,36 +350,28 @@ namespace PlayerVault
             ThrowIfDisposed();
             await EnsureLoadedAsync(default).ConfigureAwait(false);
 
-            GrantResult result;
-            long version;
-            string payload;
-
-            lock (_sync)
-            {
-                result = TryGrantLocked(resource, amount);
-                if (!result.Success || result.AmountApplied == 0) return result;
-                payload = SerializeLocked(out version);
-            }
+            var result = default(GrantResult);
 
             try
             {
-                await WriteAsync(version, payload).ConfigureAwait(false);
+                await SaveChangeAsync(
+                    () =>
+                    {
+                        result = TryGrantLocked(resource, amount);
+                        return result.Success && result.AmountApplied > 0;
+                    },
+                    () => SubtractLocked(resource, result.AmountApplied)).ConfigureAwait(false);
             }
             catch (VaultStorageException exception)
             {
-                long balance;
-                lock (_sync)
-                {
-                    SubtractLocked(resource, result.AmountApplied);
-                    balance = GetBalanceLocked(resource);
-                }
-
                 _logger.Error(
                     $"[PlayerVault] Granting {amount} {resource} was rolled back: the change could not be saved.",
                     exception);
 
-                return GrantResult.Fail(SpendFailure.StorageUnavailable, balance);
+                return GrantResult.Fail(SpendFailure.StorageUnavailable, GetBalance(resource));
             }
+
+            if (!result.Success || result.AmountApplied == 0) return result;
 
             RaiseBalanceChanged(resource);
             return result;
@@ -392,31 +403,23 @@ namespace PlayerVault
             // charge the wrong amount and then overwrite the save.
             await EnsureLoadedAsync(default).ConfigureAwait(false);
 
-            List<ResourceChange> changes;
-            SpendFailure failure;
-            string failedResource;
-            long version;
-            string payload;
-
-            lock (_sync)
-            {
-                if (!TryStageLocked(transaction, out changes, out failure, out failedResource))
-                    return TransactionResult.Fail(failure, failedResource);
-
-                payload = SerializeLocked(out version);
-            }
+            List<ResourceChange> changes = null;
+            var failure = SpendFailure.None;
+            string failedResource = null;
 
             try
             {
-                await WriteAsync(version, payload).ConfigureAwait(false);
+                await SaveChangeAsync(
+                    () => TryStageLocked(transaction, out changes, out failure, out failedResource),
+                    () => RevertLocked(changes)).ConfigureAwait(false);
             }
             catch (VaultStorageException exception)
             {
-                lock (_sync) RevertLocked(changes);
-
                 _logger.Error($"[PlayerVault] {transaction} was rolled back: it could not be saved.", exception);
                 return TransactionResult.Fail(SpendFailure.StorageUnavailable, null);
             }
+
+            if (changes == null) return TransactionResult.Fail(failure, failedResource);
 
             foreach (var change in changes) RaiseBalanceChanged(change.Resource);
             return TransactionResult.Ok(changes);
@@ -609,7 +612,9 @@ namespace PlayerVault
         /// process killed mid-claim could lose the reward or grant it twice.
         /// </para>
         /// <para>
-        /// Concurrent calls for the same reward id share one request. The shared entry is
+        /// Concurrent calls for the same reward id share one request. A call for the same id with
+        /// a different resource or amount fails with <see cref="ClaimFailure.Conflict"/> instead
+        /// of reporting the other request's outcome as its own. The shared entry is
         /// registered before any work starts, so a handler that calls this method again from a
         /// state-change event joins the running claim. The granted set is checked again when
         /// the reward is applied.
@@ -646,7 +651,20 @@ namespace PlayerVault
 
                 if (_inFlight.TryGetValue(rewardId, out var running))
                 {
-                    joined = running;
+                    if (!string.Equals(running.Resource, resource, StringComparison.Ordinal) || running.Amount != amount)
+                    {
+                        // Joining would report the running claim's outcome as this one's.
+                        _logger.Warn(
+                            $"[PlayerVault] Claim '{rewardId}' is in progress for {running.Amount} " +
+                            $"{running.Resource}; refusing it as {amount} {resource}.");
+
+                        var current = _claims.TryGetValue(rewardId, out var stored)
+                            ? stored
+                            : NewRecord(rewardId, running.Resource, running.Amount, ClaimStatus.Pending, ClaimFailure.None);
+                        return new ClaimResult(ClaimStatus.Failed, ClaimFailure.Conflict, current);
+                    }
+
+                    joined = running.Task;
                 }
                 else
                 {
@@ -669,7 +687,7 @@ namespace PlayerVault
                     // a handler that claims again would start a second request.
                     completion = new TaskCompletionSource<ClaimResult>(
                         TaskCreationOptions.RunContinuationsAsynchronously);
-                    _inFlight[rewardId] = completion.Task;
+                    _inFlight[rewardId] = new InFlightClaim(resource, amount, completion.Task);
                 }
             }
 
@@ -834,52 +852,50 @@ namespace PlayerVault
         async Task<ClaimResult> CommitGrantAsync(string rewardId, string resource, long amount, ClaimRecord record)
         {
             ClaimRecord granted = null;
+            ClaimRecord rolledBack = null;
             ClaimResult? alreadyGranted = null;
             long applied = 0;
-            long version = 0;
-            string payload = null;
-
-            lock (_sync)
-            {
-                // Second check behind the in-flight table: if this reward was granted while the
-                // request was out, do not apply it again.
-                if (_granted.Contains(rewardId))
-                {
-                    alreadyGranted = new ClaimResult(ClaimStatus.AlreadyGranted, ClaimFailure.None, _claims[rewardId]);
-                }
-                else
-                {
-                    applied = ApplyClampedLocked(resource, amount);
-                    granted = record.With(
-                        status: ClaimStatus.Granted,
-                        failure: ClaimFailure.None,
-                        amountApplied: applied,
-                        updatedAt: _clock.UtcNow);
-
-                    _granted.Add(rewardId);
-                    _claims[rewardId] = granted;
-                    payload = SerializeLocked(out version);
-                }
-            }
-
-            if (alreadyGranted.HasValue) return alreadyGranted.Value;
 
             try
             {
-                await WriteAsync(version, payload).ConfigureAwait(false);
+                await SaveChangeAsync(
+                    () =>
+                    {
+                        // Second check behind the in-flight table: if this reward was granted while
+                        // the request was out, do not apply it again.
+                        if (_granted.Contains(rewardId))
+                        {
+                            alreadyGranted = new ClaimResult(ClaimStatus.AlreadyGranted, ClaimFailure.None, _claims[rewardId]);
+                            return false;
+                        }
+
+                        applied = ApplyClampedLocked(resource, amount);
+                        granted = record.With(
+                            status: ClaimStatus.Granted,
+                            failure: ClaimFailure.None,
+                            amountApplied: applied,
+                            updatedAt: _clock.UtcNow);
+
+                        _granted.Add(rewardId);
+                        _claims[rewardId] = granted;
+                        return true;
+                    },
+                    () =>
+                    {
+                        // Undo the grant instead of reporting one that would be lost on restart.
+                        // The claim goes back to pending, which matches what is on disk, and is
+                        // retried later.
+                        SubtractLocked(resource, applied);
+                        _granted.Remove(rewardId);
+                        rolledBack = record.With(failure: ClaimFailure.Storage, updatedAt: _clock.UtcNow);
+                        _claims[rewardId] = rolledBack;
+                    }).ConfigureAwait(false);
             }
             catch (VaultStorageException exception)
             {
-                // Undo the grant instead of reporting one that would be lost on restart. The
-                // claim goes back to pending, which matches what is on disk, and is retried later.
-                ClaimRecord rolledBack;
-                lock (_sync)
-                {
-                    SubtractLocked(resource, applied);
-                    _granted.Remove(rewardId);
-                    rolledBack = record.With(failure: ClaimFailure.Storage, updatedAt: _clock.UtcNow);
-                    _claims[rewardId] = rolledBack;
-                }
+                // Disposed before the change was made: nothing to undo, and the claim is still
+                // pending as recorded.
+                rolledBack ??= record.With(failure: ClaimFailure.Storage);
 
                 _logger.Error(
                     $"[PlayerVault] Claim '{rewardId}' was accepted but could not be saved; it stays pending.",
@@ -888,6 +904,8 @@ namespace PlayerVault
                 RaiseClaimStateChanged(rolledBack);
                 return new ClaimResult(ClaimStatus.Pending, ClaimFailure.Storage, rolledBack);
             }
+
+            if (alreadyGranted.HasValue) return alreadyGranted.Value;
 
             RaiseClaimStateChanged(granted);
             RaiseBalanceChanged(resource);
@@ -966,29 +984,17 @@ namespace PlayerVault
         /// </summary>
         async Task CommitAsync(ClaimRecord record, ClaimRecord fallback)
         {
-            long version;
-            string payload;
-
-            lock (_sync)
-            {
-                _claims[record.RewardId] = record;
-                payload = SerializeLocked(out version);
-            }
-
-            try
-            {
-                await WriteAsync(version, payload).ConfigureAwait(false);
-            }
-            catch
-            {
-                lock (_sync)
+            await SaveChangeAsync(
+                () =>
+                {
+                    _claims[record.RewardId] = record;
+                    return true;
+                },
+                () =>
                 {
                     if (fallback == null) _claims.Remove(record.RewardId);
                     else _claims[record.RewardId] = fallback;
-                }
-
-                throw;
-            }
+                }).ConfigureAwait(false);
 
             RaiseClaimStateChanged(record);
         }
@@ -1065,14 +1071,18 @@ namespace PlayerVault
                     exception);
             }
 
-            if (!string.IsNullOrEmpty(payload))
+            // Only null means there is no save. An empty or truncated file is a damaged save, and
+            // goes through the corrupt-data policy like any other; treating it as a new player
+            // would silently drop the balances and the record of granted rewards.
+            if (payload != null)
             {
                 payload = seal != null
                     ? await UnsealAsync(seal, payload, cancellationToken).ConfigureAwait(false)
                     : SaveSeal.Unwrap(payload);
             }
 
-            if (!string.IsNullOrEmpty(payload))
+            // Null here also when a tampered save was quarantined.
+            if (payload != null)
             {
                 if (VaultSerializer.TryDeserialize(payload, out var document, out var error))
                 {
@@ -1254,6 +1264,12 @@ namespace PlayerVault
         /// Once this returns, another vault can open the same save and will see everything this
         /// one wrote. A vault opened on the save earlier waits for this to finish anyway.
         /// </remarks>
+        /// <exception cref="VaultStorageException">
+        /// The final write failed. The vault stays open and keeps its save, so nothing in memory
+        /// is lost: call <see cref="CloseAsync"/> again to retry, or <see cref="Dispose"/> to give
+        /// up on the unsaved changes. A vault waiting to open the same save keeps waiting until
+        /// one of those happens.
+        /// </exception>
         public async Task CloseAsync()
         {
             if (!_disposed)
@@ -1262,9 +1278,22 @@ namespace PlayerVault
                 // waits for it instead of failing because the save is still in use.
                 OpenVaults.BeginRelease(_saveKey, this, _closed.Task);
 
-                try { await PersistAsync().ConfigureAwait(false); }
-                catch (VaultStorageException exception) { _logger.Error("[PlayerVault] Final flush failed.", exception); }
-                finally { Dispose(); }
+                try
+                {
+                    await PersistAsync().ConfigureAwait(false);
+                }
+                catch (VaultStorageException) when (!_disposed)
+                {
+                    // Take the save back, so it is in use again rather than closing.
+                    OpenVaults.CancelRelease(_saveKey, this);
+                    throw;
+                }
+                catch (VaultStorageException)
+                {
+                    // Disposed while flushing: whoever disposed it gave up on unsaved changes.
+                }
+
+                Dispose();
             }
 
             await _closed.Task.ConfigureAwait(false);
@@ -1324,54 +1353,129 @@ namespace PlayerVault
             }
         }
 
-        async Task PersistAsync()
+        /// <summary>
+        /// Saves whatever is in memory. A call made while an earlier one is still waiting for the
+        /// write gate joins it: that write has not taken its snapshot yet, so it will include
+        /// this caller's changes.
+        /// </summary>
+        Task PersistAsync()
         {
-            long version;
-            string payload;
+            TaskCompletionSource<bool> queued;
 
-            lock (_sync) payload = SerializeLocked(out version);
+            lock (_sync)
+            {
+                if (_queuedPersist != null) return _queuedPersist.Task;
+                queued = _queuedPersist = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            }
 
-            await WriteAsync(version, payload).ConfigureAwait(false);
+            _ = RunQueuedPersistAsync(queued);
+            return queued.Task;
         }
 
-        /// <summary>Takes a numbered snapshot. Must be called while holding <see cref="_sync"/>.</summary>
-        string SerializeLocked(out long version)
+        async Task RunQueuedPersistAsync(TaskCompletionSource<bool> queued)
         {
-            version = ++_stateVersion;
-            return VaultSerializer.Serialize(SnapshotLocked(), pretty: _keyStore == null);
+            try
+            {
+                await SaveChangeAsync(
+                    () =>
+                    {
+                        // Snapshot taken next: later changes need a write of their own.
+                        _queuedPersist = null;
+                        return true;
+                    },
+                    null).ConfigureAwait(false);
+
+                queued.TrySetResult(true);
+            }
+            catch (Exception exception)
+            {
+                lock (_sync)
+                {
+                    if (_queuedPersist == queued) _queuedPersist = null;
+                }
+
+                queued.TrySetException(exception);
+            }
         }
 
-        async Task WriteAsync(long version, string payload)
+        /// <summary>
+        /// Makes a change and saves it as one commit. Commits run one at a time, from the change
+        /// until the write has finished or been undone.
+        /// </summary>
+        /// <remarks>
+        /// Holding the gate for the whole commit is what makes a failed write safe to undo. If the
+        /// next commit could take its snapshot while this write was still running, that snapshot
+        /// would contain this change, and would save it after this commit had undone it and told
+        /// its caller it failed.
+        /// <para>
+        /// Changes from <see cref="Spend"/> and <see cref="GrantLocal"/> do not wait for the gate,
+        /// so a snapshot may include one of those. That is safe: <paramref name="undo"/> reverses
+        /// only this commit's own change, and theirs is saved by their own scheduled write.
+        /// </para>
+        /// </remarks>
+        /// <param name="apply">Runs under the lock. Makes the change and returns true, or returns
+        /// false to write nothing.</param>
+        /// <param name="undo">Runs under the lock if the write fails. Null for nothing to undo.</param>
+        /// <exception cref="VaultStorageException">The write failed and <paramref name="undo"/>
+        /// has run, or the vault was disposed before the change was made.</exception>
+        async Task SaveChangeAsync(Func<bool> apply, Action undo)
         {
-            long sealedCounter = 0;
-
             await _writeGate.WaitAsync().ConfigureAwait(false);
             try
             {
-                // A newer snapshot is already on disk and includes this one's changes, so
-                // writing this one would move the file backwards.
-                if (version <= _writtenVersion) return;
-
                 // Once disposed, the save may already belong to a new vault, which would lose
                 // whatever this write replaced.
                 if (_disposed)
-                    throw new ObjectDisposedException(nameof(Vault),
-                        "The vault was disposed before this change was written. Use CloseAsync to save before closing.");
+                {
+                    throw new VaultStorageException(
+                        _playerId, $"PlayerVault could not write the state for '{_playerId}'.",
+                        new ObjectDisposedException(nameof(Vault),
+                            "The vault was disposed before this change was written. Use CloseAsync to save before closing."));
+                }
 
+                string payload;
+                lock (_sync)
+                {
+                    if (!apply()) return;
+                    payload = VaultSerializer.Serialize(SnapshotLocked(), pretty: _keyStore == null);
+                }
+
+                try
+                {
+                    await WriteHeldAsync(payload).ConfigureAwait(false);
+                }
+                catch
+                {
+                    if (undo != null)
+                    {
+                        lock (_sync) undo();
+                    }
+
+                    throw;
+                }
+            }
+            finally
+            {
+                _writeGate.Release();
+            }
+        }
+
+        /// <summary>Writes a snapshot. The caller holds <see cref="_writeGate"/>.</summary>
+        async Task WriteHeldAsync(string payload)
+        {
+            long sealedCounter = 0;
+
+            try
+            {
                 // Sealed under the write gate, so counters follow the order files are written in.
                 var stored = _seal != null ? _seal.Seal(payload, out sealedCounter) : payload;
 
                 await _storage.WriteAsync(_playerId, stored).ConfigureAwait(false);
-                _writtenVersion = version;
             }
             catch (Exception exception)
             {
                 throw new VaultStorageException(
                     _playerId, $"PlayerVault could not write the state for '{_playerId}'.", exception);
-            }
-            finally
-            {
-                _writeGate.Release();
             }
 
             // Only reached when the write succeeded. The counter follows the file, never leads it.
@@ -1441,19 +1545,26 @@ namespace PlayerVault
 
         // ------------------------------------------------------------------- events
 
+        // Each subscriber is called separately. Invoking the multicast delegate would stop at the
+        // first one that throws, and the rest would miss the event.
+
         void RaiseBalanceChanged(string resource)
         {
             var handler = BalanceChanged;
             if (handler == null) return;
 
-            try
+            var balance = GetBalance(resource);
+            foreach (Action<string, long> subscriber in handler.GetInvocationList())
             {
-                handler(resource, GetBalance(resource));
-            }
-            catch (Exception exception)
-            {
-                // The change is already saved. A handler that throws should not break the vault.
-                _logger.Error($"[PlayerVault] A BalanceChanged subscriber threw for '{resource}'.", exception);
+                try
+                {
+                    subscriber(resource, balance);
+                }
+                catch (Exception exception)
+                {
+                    // The change is already saved. A handler that throws should not break the vault.
+                    _logger.Error($"[PlayerVault] A BalanceChanged subscriber threw for '{resource}'.", exception);
+                }
             }
         }
 
@@ -1462,13 +1573,16 @@ namespace PlayerVault
             var handler = ClaimStateChanged;
             if (handler == null) return;
 
-            try
+            foreach (Action<ClaimRecord> subscriber in handler.GetInvocationList())
             {
-                handler(record);
-            }
-            catch (Exception exception)
-            {
-                _logger.Error($"[PlayerVault] A ClaimStateChanged subscriber threw for '{record.RewardId}'.", exception);
+                try
+                {
+                    subscriber(record);
+                }
+                catch (Exception exception)
+                {
+                    _logger.Error($"[PlayerVault] A ClaimStateChanged subscriber threw for '{record.RewardId}'.", exception);
+                }
             }
         }
 

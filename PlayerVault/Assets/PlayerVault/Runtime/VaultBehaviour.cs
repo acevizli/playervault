@@ -4,6 +4,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using PlayerVault.Internal;
 using UnityEngine;
 
 namespace PlayerVault
@@ -164,8 +165,6 @@ namespace PlayerVault
         static readonly object SharedGate = new object();
         static readonly Dictionary<string, SharedVault> Shared = new Dictionary<string, SharedVault>(StringComparer.Ordinal);
 
-        static int s_mainThreadId = -1;
-
         /// <summary>The vault, or null until it has finished opening.</summary>
         public Vault Vault { get; private set; }
 
@@ -225,7 +224,7 @@ namespace PlayerVault
 
         async void Awake()
         {
-            s_mainThreadId = Thread.CurrentThread.ManagedThreadId;
+            UnityThread.Capture();
 
             if (persistAcrossScenes) KeepAcrossScenes();
 
@@ -305,6 +304,20 @@ namespace PlayerVault
 
         async Task<Vault> OpenCoreAsync(VaultConfig config)
         {
+            try
+            {
+                // Created here, on the caller's thread, because the vault itself may be created
+                // after an await on a worker thread: when the previous scene's vault is still
+                // closing, JoinAsync waits for it first.
+                config = config.WithDefaultServices();
+            }
+            catch (Exception exception)
+            {
+                lock (_gate) _opening = null;
+                PublishOnMainThread(() => PublishFailure(exception));
+                throw;
+            }
+
             var shared = await JoinAsync(config).ConfigureAwait(false);
 
             lock (_gate)
@@ -394,6 +407,8 @@ namespace PlayerVault
                     closing = shared.Closed;
                 }
 
+                // May resume on a worker thread. The config's services were created on the main
+                // thread by OpenCoreAsync, so creating the vault from here is safe.
                 try { await closing.ConfigureAwait(false); }
                 catch (Exception) { /* only the timing matters here */ }
             }
@@ -424,7 +439,7 @@ namespace PlayerVault
                 try { vault = await shared.Opening.ConfigureAwait(false); }
                 catch (Exception) { return; }   // never opened, so nothing to close
 
-                await vault.CloseAsync().ConfigureAwait(false);
+                await CloseOrGiveUpAsync(vault).ConfigureAwait(false);
             }
             catch (Exception exception)
             {
@@ -543,7 +558,7 @@ namespace PlayerVault
                 Vault = opened;
             }
 
-            Opened?.Invoke(opened);
+            RaiseEach(Opened, subscriber => ((Action<Vault>)subscriber)(opened));
         }
 
         void PublishFailure(Exception exception)
@@ -551,15 +566,31 @@ namespace PlayerVault
             OpenError = exception;
             Debug.LogError($"[PlayerVault] Opening the vault failed: {exception.Message}");
 
-            if (OpenFailed != null) OpenFailed.Invoke(exception);
+            if (OpenFailed != null) RaiseEach(OpenFailed, subscriber => ((Action<Exception>)subscriber)(exception));
             else Debug.LogException(exception);
         }
 
         void OnVaultBalanceChanged(string resource, long balance) =>
-            RunOnMainThread(() => BalanceChanged?.Invoke(resource, balance));
+            RunOnMainThread(() => RaiseEach(BalanceChanged, subscriber => ((Action<string, long>)subscriber)(resource, balance)));
 
         void OnVaultClaimStateChanged(ClaimRecord record) =>
-            RunOnMainThread(() => ClaimStateChanged?.Invoke(record));
+            RunOnMainThread(() => RaiseEach(ClaimStateChanged, subscriber => ((Action<ClaimRecord>)subscriber)(record)));
+
+        /// <summary>
+        /// Calls each subscriber separately. Invoking the multicast delegate would stop at the
+        /// first one that throws, so a broken HUD listener would hide the event from the rest,
+        /// including a <see cref="WhenOpenAsync"/> waiting on <see cref="Opened"/>.
+        /// </summary>
+        void RaiseEach(Delegate handler, Action<Delegate> invoke)
+        {
+            if (handler == null) return;
+
+            foreach (var subscriber in handler.GetInvocationList())
+            {
+                try { invoke(subscriber); }
+                catch (Exception exception) { Debug.LogException(exception, this); }
+            }
+        }
 
         /// <summary>Queues an action to run on the main thread at the next Update.</summary>
         public void RunOnMainThread(Action action)
@@ -567,7 +598,7 @@ namespace PlayerVault
             if (action != null) _mainThread.Enqueue(action);
         }
 
-        static bool OnMainThread => Thread.CurrentThread.ManagedThreadId == s_mainThreadId;
+        static bool OnMainThread => UnityThread.IsMain;
 
         /// <summary>
         /// Runs now when already on the main thread, so an open that completes there is visible
@@ -582,16 +613,9 @@ namespace PlayerVault
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
         static void OnPlayModeStart()
         {
-            s_mainThreadId = Thread.CurrentThread.ManagedThreadId;
-
             // With domain reload turned off, statics survive between play sessions.
             lock (SharedGate) Shared.Clear();
         }
-
-#if UNITY_EDITOR
-        [UnityEditor.InitializeOnLoadMethod]
-        static void OnEditorLoad() => s_mainThreadId = Thread.CurrentThread.ManagedThreadId;
-#endif
 
         // ------------------------------------------------------------------ waiting for the open
 
@@ -897,8 +921,41 @@ namespace PlayerVault
 
         static async Task CloseQuietlyAsync(Vault vault)
         {
-            try { await vault.CloseAsync().ConfigureAwait(false); }
+            try { await CloseOrGiveUpAsync(vault).ConfigureAwait(false); }
             catch (Exception exception) { Debug.LogException(exception); }
         }
+
+        /// <summary>
+        /// Closes a vault whose component is gone. A failed close keeps the vault open for a retry,
+        /// but nothing is left to retry it, so this retries once and then disposes it, which
+        /// frees the save for the next scene at the cost of the unsaved changes.
+        /// </summary>
+        static async Task CloseOrGiveUpAsync(Vault vault)
+        {
+            try
+            {
+                await vault.CloseAsync().ConfigureAwait(false);
+                return;
+            }
+            catch (VaultStorageException exception)
+            {
+                Debug.LogWarning($"[PlayerVault] The final save failed; retrying once. {exception.Message}");
+            }
+
+            await Task.Delay(CloseRetryDelay).ConfigureAwait(false);
+
+            try
+            {
+                await vault.CloseAsync().ConfigureAwait(false);
+            }
+            catch (VaultStorageException exception)
+            {
+                Debug.LogError("[PlayerVault] The final save failed again. Changes since the last save are lost.");
+                Debug.LogException(exception);
+                vault.Dispose();
+            }
+        }
+
+        static readonly TimeSpan CloseRetryDelay = TimeSpan.FromMilliseconds(500);
     }
 }

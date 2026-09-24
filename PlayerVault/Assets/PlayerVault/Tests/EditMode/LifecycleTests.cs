@@ -259,6 +259,89 @@ namespace PlayerVault.Tests
             }
         }
 
+        [Test]
+        public void A_throwing_Opened_subscriber_does_not_fail_the_open_or_block_the_others()
+        {
+            LogAssert.ignoreFailingMessages = true;   // the broken handler is logged
+
+            var behaviour = CreateBehaviour();
+
+            try
+            {
+                var second = false;
+                behaviour.Opened += _ => throw new InvalidOperationException("a broken HUD");
+                behaviour.Opened += _ => second = true;
+                var waiting = behaviour.WhenOpenAsync();
+
+                Assert.DoesNotThrow(() => Run(behaviour.OpenAsync(BehaviourConfig())));
+
+                Assert.IsTrue(second, "later subscribers still run");
+                Assert.IsTrue(waiting.IsCompleted && !waiting.IsFaulted, "WhenOpenAsync still completes");
+            }
+            finally
+            {
+                LogAssert.ignoreFailingMessages = false;
+                Cleanup(behaviour);
+            }
+        }
+
+        [Test]
+        public void A_component_opening_while_the_last_scenes_vault_closes_can_use_the_default_services()
+        {
+            // The scene-change case. The next scene's component waits for the old vault's final
+            // write and resumes on a worker thread. Creating the default JsonFileStorage there
+            // threw, because Application.persistentDataPath is main-thread only.
+            var playerId = "behaviour-" + Guid.NewGuid().ToString("N");
+            var storage = new InMemoryStorage();
+            var old = CreateBehaviour();
+            var next = CreateBehaviour();
+            Vault opened = null;
+
+            try
+            {
+                Run(old.OpenAsync(BehaviourConfig(playerId, storage)));
+
+                var held = new TaskCompletionSource<bool>();
+                storage.Hold = _ => held.Task;
+
+                // OnDestroy does not run in edit mode, so call it: the last user leaving closes
+                // the vault, and its final write is held.
+                typeof(VaultBehaviour)
+                    .GetMethod("OnDestroy", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+                    .Invoke(old, null);
+
+                var config = BehaviourConfig(playerId);
+                config.Transport = null;
+                config.Storage = null;
+                config.KeyStore = null;
+
+                var opening = next.OpenAsync(config);
+                Assert.IsFalse(opening.IsCompleted, "the open waits for the old vault's final write");
+
+                held.SetResult(true);
+                opened = Run(opening);
+
+                Assert.IsNotNull(opened);
+            }
+            finally
+            {
+                storage.Hold = null;
+                opened?.Dispose();
+                Cleanup(old, next);
+                Run(Vault.DeleteSaveAsync(playerId));
+            }
+        }
+
+        [Test]
+        public void A_vault_with_default_services_refuses_to_be_created_off_the_main_thread()
+        {
+            var config = Config();
+            config.Storage = null;
+
+            var exception = Assert.Throws<InvalidOperationException>(() => Run(Task.Run(() => Vault.OpenAsync(config))));
+            StringAssert.Contains("main thread", exception.Message);
+        }
+
         // ------------------------------------------------------------ helpers
 
         static string TemporaryFolder()

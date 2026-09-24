@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using PlayerVault.Internal;
 
 namespace PlayerVault
 {
@@ -168,6 +169,42 @@ namespace PlayerVault
 
             if (Retry.Jitter < 0d || Retry.Jitter > 1d)
                 throw new ArgumentException("RetryPolicy.Jitter must be between 0 and 1.", nameof(Retry));
+        }
+
+        /// <summary>Whether the vault would create a default transport, storage or key store.</summary>
+        bool NeedsDefaultServices => Transport == null || Storage == null || (DetectTampering && KeyStore == null);
+
+        /// <summary>
+        /// Throws if the default services would be created off Unity's main thread. They read
+        /// <c>Application.persistentDataPath</c> and capture the main thread's context, so off it
+        /// they fail, or fail later on the first request.
+        /// </summary>
+        internal void ThrowIfDefaultsOffMainThread()
+        {
+            if (NeedsDefaultServices && UnityThread.IsOtherThread)
+            {
+                throw new InvalidOperationException(
+                    "A Vault using the default transport, storage or key store must be created on Unity's main " +
+                    "thread, because they read Application.persistentDataPath and capture the main thread's " +
+                    "context. Open it from the main thread, or set VaultConfig.Transport, Storage and KeyStore.");
+            }
+        }
+
+        /// <summary>
+        /// A validated copy with the default transport, storage and key store already created, so
+        /// the vault can then be created on any thread. Call on the main thread.
+        /// </summary>
+        internal VaultConfig WithDefaultServices()
+        {
+            Validate();
+            ThrowIfDefaultsOffMainThread();
+
+            var copy = (VaultConfig)MemberwiseClone();
+            copy.Resources = new List<ResourceDefinition>(Resources);
+            copy.Transport ??= new UnityWebRequestTransport(Retry.Timeout);
+            copy.Storage ??= new JsonFileStorage();
+            if (DetectTampering) copy.KeyStore ??= DefaultKeyStore.Create();
+            return copy;
         }
     }
 }

@@ -73,6 +73,12 @@ vault.
   with backoff. If every attempt fails, the claim stays `Pending` until the next launch or a
   call to `ResumePendingAsync()`. A claim only becomes `Failed` on a 4xx or invalid input.
 - A pending claim doesn't hold any balance, so the player can keep spending while it runs.
+- Saves that must land (`SpendAsync`, `GrantAsync`, `TransactAsync` and the writes inside a
+  claim) go through one at a time. Each change is written, or undone if the write fails, before
+  the next one reads the state. Otherwise a later save could put a change on disk that the game
+  had already been told failed. Waiting for the network isn't part of that queue.
+- `CloseAsync()` throws if the last save fails, and the vault stays open so the game can try
+  again. An empty save file is treated as damaged, not as a new player.
 - Running out of coins returns a result. A bad config throws as soon as the vault is created.
 - If a reward would go over a resource's max, the extra is dropped, and `AmountApplied` and
   `WasClamped` tell the game how much landed.
@@ -89,10 +95,11 @@ Unity -batchmode -nographics -projectPath PlayerVault \
       -executeMethod PlayerVault.Tests.BatchTestRunner.RunEditMode
 ```
 
-There are 103 EditMode tests, all passing. They swap in fakes for the network, the disk and the
+There are 118 EditMode tests, all passing. They swap in fakes for the network, the disk and the
 clock, which lets them cover insufficient balance, caps, repeated and simultaneous claims,
 offline, timeouts, 4xx against 5xx, restarting in the middle of a claim, a crash while saving,
-unreadable and edited saves, and spending while a claim is running. The PlayMode tests call
+unreadable, empty and edited saves, overlapping saves where one fails, a failed close, and
+spending while a claim is running. The PlayMode tests call
 the real httpbin endpoint through `UnityWebRequest`, and one points at a host that doesn't exist.
 
 In CoinRush, clearing a level, restarting and clearing it again gives `AlreadyGranted` and no
